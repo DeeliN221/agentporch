@@ -1,0 +1,854 @@
+/**
+ * PURPOSE: Own oz flow workflow status-summary marker and runtime-state rules.
+ */
+import path from 'node:path';
+import {
+  collectDagTargetsByStage,
+  mergeStageArtifacts,
+  mergeStageSessions,
+} from './dag-read-model.js';
+import {
+  acceptedProviderFromSessionKey,
+  inferSubagentRoleStage,
+  isKnownProvider,
+  resolvePlannerSessionRef,
+  resolveSessionProviderFromState,
+} from './stage-session-resolver.js';
+import { pick, type WorkflowArtifactRef, type WorkflowJsonRecord, type WorkflowRunnerProcess, type WorkflowSessionRef, type WorkflowStageStatus, type WorkflowState } from './workflow-state-schema.js';
+import {
+  LEGACY_STAGE_ORDER,
+  mapStageStatus,
+  parseFixStage,
+  parseReviewStage,
+  stageDisplayText,
+  stageLabel,
+} from './stage-taxonomy.js';
+
+type StageStatus = WorkflowStageStatus;
+type SessionRef = WorkflowSessionRef;
+type RunnerProcess = WorkflowRunnerProcess;
+type ArtifactRef = WorkflowArtifactRef;
+
+const TERMINAL_METADATA_STAGES = new Set(['done']);
+const SUBSTAGE_TITLES: Record<string, string> = {
+  planning: 'Planning',
+  acceptance: 'Acceptance plan',
+  execution: 'Implementation',
+  verification: 'Review',
+  ready_for_acceptance: 'Ready for acceptance',
+  review_1: 'Requirements and scope coverage',
+  repair_1: 'First repair output',
+  review_2: 'Implementation risks and regressions',
+  repair_2: 'Second repair output',
+  review_3: 'Acceptance and delivery',
+  repair_3: 'Third repair output',
+  qa_1: 'QA acceptance',
+  qa_2: 'QA2 acceptance',
+  qa_3: 'QA3 acceptance',
+  qa: 'QA acceptance',
+  archive: 'Archive',
+};
+
+export const COMPLETED_STATUSES = ['completed', 'done', 'success', 'succeeded', 'archived'];
+export const ACTIVE_STATUSES = ['running', 'active', 'in_progress'];
+export const FAILED_STATUSES = ['failed', 'error', 'aborted'];
+
+/**
+ * Return the explicit stage from an oz flow process row, accepting current and
+ * historical field spellings.
+ */
+function pickProcessStage(process: RunnerProcess): string {
+  return String(
+    pick(process, 'stage')
+    || pick(process, 'stage_key')
+    || process?.stageKey
+    || '',
+  ).trim();
+}
+
+/**
+ * Parse oz flow runner stage keys into sortable workflow positions.
+ */
+function parseRunnerStage(stage: unknown): { known: boolean; displayable: boolean; order: number } {
+  const normalized = String(stage || '').trim();
+  if (!normalized || TERMINAL_METADATA_STAGES.has(normalized)) {
+    return { known: true, displayable: false, order: Number.POSITIVE_INFINITY };
+  }
+  if (normalized === 'execution') {
+    return { known: true, displayable: true, order: 0 };
+  }
+  if (normalized === 'acceptance') {
+    return { known: true, displayable: true, order: -10 };
+  }
+  if (Object.prototype.hasOwnProperty.call(LEGACY_STAGE_ORDER, normalized)) {
+    return { known: true, displayable: true, order: LEGACY_STAGE_ORDER[normalized] };
+  }
+  if (normalized === 'archive') {
+    return { known: true, displayable: true, order: Number.MAX_SAFE_INTEGER - 1 };
+  }
+  if (normalized === 'qa') {
+    return { known: true, displayable: true, order: Number.MAX_SAFE_INTEGER - 2 };
+  }
+  const reviewIteration = parseReviewStage(normalized);
+  if (reviewIteration) {
+    return { known: true, displayable: true, order: reviewIteration * 3 - 2 };
+  }
+  const qaMatch = normalized.match(/^qa_(\d+)$/);
+  if (qaMatch) {
+    const iteration = Number(qaMatch[1]);
+    if (Number.isInteger(iteration) && iteration > 0) {
+      return { known: true, displayable: true, order: iteration * 3 - 1 };
+    }
+  }
+  const fixIteration = parseFixStage(normalized);
+  if (fixIteration) {
+    return { known: true, displayable: true, order: fixIteration * 3 };
+  }
+  return { known: false, displayable: true, order: Number.MAX_SAFE_INTEGER };
+}
+
+/**
+ * Decide whether a runner status means completed work.
+ */
+export function isCompletedStatus(status: unknown): boolean {
+  return COMPLETED_STATUSES.includes(String(status || '').toLowerCase());
+}
+
+/**
+ * Decide whether a runner status means active work.
+ */
+export function isActiveStatus(status: unknown): boolean {
+  return ACTIVE_STATUSES.includes(String(status || '').toLowerCase());
+}
+
+/**
+ * Decide whether a runner status means blocked work.
+ */
+export function isBlockedStatus(status: unknown): boolean {
+  return String(status || '').toLowerCase() === 'blocked';
+}
+
+/**
+ * Render the compact marker used by oz flow status/watch summary rows.
+ */
+export function markerForStageStatus(stageKey: string, currentStage: string, status: unknown): string {
+  const normalized = String(status || '').toLowerCase();
+  if (stageKey === currentStage && isActiveStatus(normalized)) {
+    return '→';
+  }
+  if (isCompletedStatus(normalized)) {
+    return '✓';
+  }
+  if (FAILED_STATUSES.includes(normalized)) {
+    return '✗';
+  }
+  if (isBlockedStatus(normalized)) {
+    return '⊘';
+  }
+  return ' ';
+}
+
+/**
+ * Build normalized stage statuses from runner state and current stage fallback.
+ */
+export function buildStageStatuses(
+  state: WorkflowState,
+  currentStage: string,
+  rawStatus: string,
+  warnings: string[],
+): StageStatus[] {
+  const stages = pick(state, 'stages') || {};
+  const processes = Array.isArray(pick(state, 'processes')) ? pick(state, 'processes') : [];
+  const sessions = pick(state, 'sessions') || {};
+  const processStageStatuses = new Map<string, string>();
+  const stageKeys = new Set<string>();
+  if (currentStage && parseRunnerStage(currentStage).displayable) {
+    stageKeys.add(currentStage);
+  }
+  for (const stage of Object.keys(stages && typeof stages === 'object' ? stages : {})) {
+    const parsedStage = parseRunnerStage(stage);
+    if (!parsedStage.displayable) {
+      continue;
+    }
+    stageKeys.add(stage);
+    if (!parsedStage.known) {
+      warnings.push(`Unknown runner stage: ${stage}`);
+    }
+  }
+  for (const process of processes) {
+    const stage = pickProcessStage(process);
+    const parsedStage = parseRunnerStage(stage);
+    if (!stage || !parsedStage.displayable) {
+      continue;
+    }
+    stageKeys.add(stage);
+    if (!parsedStage.known) {
+      warnings.push(`Unknown runner process stage: ${stage}`);
+    }
+    const status = String(pick(process, 'status') || '').trim();
+    if (status && !processStageStatuses.has(stage)) {
+      processStageStatuses.set(stage, status);
+    }
+  }
+  for (const key of Object.keys(sessions && typeof sessions === 'object' ? sessions : {})) {
+    const parsed = acceptedProviderFromSessionKey(key);
+    if (!parsed.accepted) {
+      continue;
+    }
+    const role = String(parsed.role || '').trim();
+    const roleStage = inferSubagentRoleStage(role)
+      || (/^(?:review_\d+|audit_\d+|fix_\d+|repair_\d+|targeted_repair_\d+|qa_\d+)$/.test(role) ? role : '');
+    const parsedStage = parseRunnerStage(roleStage);
+    if (roleStage && parsedStage.displayable) {
+      stageKeys.add(roleStage);
+    }
+  }
+  const workflowConfig = pick(state, 'workflow_config');
+  const configStages = pick(workflowConfig, 'stages');
+  if (configStages && typeof configStages === 'object' && 'planning' in configStages && !stageKeys.has('planning')) {
+    stageKeys.add('planning');
+  }
+  return [...stageKeys].sort((left, right) => {
+    const leftStage = parseRunnerStage(left);
+    const rightStage = parseRunnerStage(right);
+    if (leftStage.order !== rightStage.order) {
+      return leftStage.order - rightStage.order;
+    }
+    return left.localeCompare(right);
+  }).map((key) => ({
+    key,
+    label: stageLabel(key),
+    status: mapStageStatus(key === currentStage ? rawStatus : (stages[key] || processStageStatuses.get(key) || 'pending')),
+    provider: 'codex',
+  }));
+}
+
+/**
+ * Match oz flow display jsonl labels to the runner session id they are derived from.
+ */
+function sessionMatchesJsonlName(sessionId: unknown, jsonlName: unknown, logPath = ''): boolean {
+  const normalizedSessionId = String(sessionId || '').trim();
+  const normalizedJsonlName = path.posix.basename(String(jsonlName || '').trim());
+  const normalizedLogName = path.posix.basename(String(logPath || '').trim());
+  if (!normalizedSessionId || !normalizedJsonlName) {
+    return false;
+  }
+  return normalizedJsonlName === `${normalizedSessionId}.jsonl`
+    || normalizedJsonlName.replace(/\.jsonl$/i, '') === normalizedSessionId
+    || normalizedJsonlName === normalizedLogName;
+}
+
+/**
+ * Return the most readable jsonl label for a runner process link.
+ */
+function sessionJsonlLabel(sessionId: unknown, logPath = ''): string {
+  const logName = path.posix.basename(String(logPath || '').trim());
+  if (/\.jsonl$/i.test(logName)) {
+    return logName;
+  }
+  return `${sessionId}.jsonl`;
+}
+
+/**
+ * Match oz flow checklist jsonl labels to runner child sessions.
+ */
+function findSessionRefForStage(
+  stageKey: string,
+  childSessions: SessionRef[],
+  runnerProcesses: RunnerProcess[],
+  warnings: string[],
+  jsonlName: string,
+): WorkflowJsonRecord | null {
+  const hasJsonlName = Boolean(String(jsonlName || '').trim());
+  if (!hasJsonlName && !parseRunnerStage(stageKey).known) {
+    return null;
+  }
+  const stageProcess = runnerProcesses.find((entry) => entry.stage === stageKey && entry.sessionId);
+  const stageSession = childSessions.find((session) => (
+    session.stageKey === stageKey
+    && session.address === stageKey
+    && (!hasJsonlName || sessionMatchesJsonlName(session.id, jsonlName, stageProcess?.logPath))
+  )) || childSessions.find((session) => (
+    session.stageKey === stageKey
+    && session.routePath?.endsWith(`/sessions/${stageKey}`)
+    && (!hasJsonlName || sessionMatchesJsonlName(session.id, jsonlName, stageProcess?.logPath))
+  )) || childSessions.find((session) => (
+    session.stageKey === stageKey
+    && (!hasJsonlName || sessionMatchesJsonlName(session.id, jsonlName, stageProcess?.logPath))
+  ));
+  if (stageSession) {
+    return {
+      label: jsonlName || sessionJsonlLabel(stageSession.id, stageProcess?.logPath),
+      sessionId: stageSession.id,
+      provider: stageSession.provider || 'codex',
+      stageKey,
+      address: stageSession.address,
+      routePath: stageSession.routePath,
+    };
+  }
+  const process = runnerProcesses.find((entry) => (
+    entry.stage === stageKey
+    && entry.sessionId
+    && (!hasJsonlName || sessionMatchesJsonlName(entry.sessionId, jsonlName, entry.logPath))
+  ));
+  if (process) {
+    return {
+      label: jsonlName || sessionJsonlLabel(process.sessionId, process.logPath),
+      sessionId: process.sessionId,
+      provider: process.provider || 'codex',
+      stageKey,
+      routePath: `/runs/${encodeURIComponent(childSessions[0]?.workflowId || '')}/sessions/by-id/${encodeURIComponent(String(process.sessionId || ''))}`,
+    };
+  }
+  if (hasJsonlName) {
+    warnings.push(`Unable to match workflow display session: ${jsonlName}`);
+    return {
+      label: jsonlName,
+      stageKey,
+    };
+  }
+  return null;
+}
+
+/**
+ * Remove standalone repair rows once oz flow has emitted the following review row.
+ */
+function collapseSupersededRepairLines(lines: WorkflowJsonRecord[]): WorkflowJsonRecord[] {
+  const reviewedFixNumbers = new Set(lines
+    .map((line) => String(line.text || '').trim().match(/^(\d+)\s+fix\s+review$/)?.[1])
+    .filter(Boolean));
+  if (reviewedFixNumbers.size === 0) {
+    return lines;
+  }
+  return lines.filter((line) => {
+    const fixNumber = String(line.text || '').trim().match(/^(\d+)\s+fix$/)?.[1];
+    return !fixNumber || !reviewedFixNumbers.has(fixNumber);
+  });
+}
+
+/**
+ * Build workflow checklist display lines.
+ */
+export function buildWorkflowDisplayLines(
+  state: WorkflowState,
+  stageStatuses: StageStatus[],
+  childSessions: SessionRef[],
+  runnerProcesses: RunnerProcess[],
+  warnings: string[],
+): WorkflowJsonRecord[] {
+  const displayLines = Array.isArray(state?.workflow_display?.lines) ? state.workflow_display.lines : [];
+  if (displayLines.length > 0) {
+    return collapseSupersededRepairLines(displayLines.map((line: WorkflowJsonRecord, index: number) => {
+      const rawLine = String(line?.raw_line || line?.rawLine || '').trim();
+      const marker = String(line?.marker || rawLine.match(/^[✓→ ]/)?.[0] || '').trim() || ' ';
+      const text = String(line?.text || rawLine.replace(/^[✓→ ]\s*/, '').replace(/\s+\S+\.jsonl$/, '') || '').trim();
+      const jsonlName = rawLine.match(/(\S+\.jsonl)\s*$/)?.[1] || String(pick(pick(line, 'session_ref'), 'label') || '').trim();
+      const stageKey = String(line?.stage_key || stageStatuses[index]?.key || '').trim();
+      return {
+        id: String(line?.id || `${index}:${text}`),
+        marker,
+        text,
+        status: String(line?.status || (marker === '✓' ? 'completed' : marker === '→' ? 'active' : 'pending')),
+        rawLine: rawLine || [marker, text, jsonlName].filter(Boolean).join(' '),
+        ...(jsonlName ? { sessionRef: findSessionRefForStage(stageKey, childSessions, runnerProcesses, warnings, jsonlName) } : {}),
+      };
+    }));
+  }
+
+  return collapseSupersededRepairLines(stageStatuses
+    .filter((stage) => stage.status !== 'pending')
+    .map((stage) => {
+      const marker = stage.status === 'completed' ? '✓' : stage.status === 'active' ? '→' : ' ';
+      const text = stageDisplayText(stage.key);
+      const sessionRef = findSessionRefForStage(stage.key, childSessions, runnerProcesses, warnings, '');
+      const rawLine = [marker, text, sessionRef?.label].filter(Boolean).join(' ');
+      return {
+        id: stage.key,
+        marker,
+        text,
+        status: stage.status,
+        rawLine,
+        ...(sessionRef ? { sessionRef } : {}),
+      };
+    }));
+}
+
+/**
+ * Build fixed-role workflow summary rows.
+ */
+export function buildWorkflowRoleSummary(
+  state: WorkflowState,
+  childSessions: SessionRef[],
+): WorkflowJsonRecord {
+  const stages = pick(state, 'stages') || {};
+  const sessions = pick(state, 'sessions') || {};
+  const stageEntries = Object.entries(stages && typeof stages === 'object' ? stages : {});
+
+  let writeCount = 0;
+  let acceptanceCount = 0;
+  let reviewCount = 0;
+  let fixCount = 0;
+  let qaCount = 0;
+  let archiveCount = 0;
+
+  for (const [stageKey, status] of stageEntries) {
+    const normalizedStatus = String(status || '').toLowerCase();
+    const isDone = isCompletedStatus(normalizedStatus);
+    const isActive = isActiveStatus(normalizedStatus);
+    if (!isDone && !isActive) {
+      continue;
+    }
+    if (stageKey === 'acceptance') {
+      acceptanceCount += 1;
+    } else if (stageKey === 'execution') {
+      writeCount += 1;
+    } else if (parseFixStage(stageKey)) {
+      fixCount += 1;
+    } else if (parseReviewStage(stageKey)) {
+      reviewCount += 1;
+    } else if (stageKey === 'qa' || /^qa_\d+$/.test(stageKey)) {
+      qaCount += 1;
+    } else if (stageKey === 'archive') {
+      archiveCount += 1;
+    }
+  }
+
+  /**
+   * Resolve a session id by checking all known provider prefixes for a role.
+   */
+  function findSessionByRole(role: string): { sessionId: string; provider: string } | null {
+    for (const [key, value] of Object.entries(sessions && typeof sessions === 'object' ? sessions : {})) {
+      const parsed = acceptedProviderFromSessionKey(key);
+      if (!parsed.accepted) {
+        continue;
+      }
+      if (parsed.role === role && value) {
+        return { sessionId: String(value).trim(), provider: parsed.provider };
+      }
+    }
+    return null;
+  }
+
+  function resolveSessionRef(role: string, label: string): WorkflowJsonRecord | null {
+    let sessionId = '';
+    let sessionProvider = 'codex';
+
+    const providerMatch = findSessionByRole(role);
+    if (providerMatch) {
+      sessionId = providerMatch.sessionId;
+      sessionProvider = providerMatch.provider;
+    }
+    if (!sessionId) {
+      const roleFallbacks: Record<string, string[]> = {
+        acceptance: ['acceptance'],
+        executor: ['execution'],
+        reviewer: ['review_1', 'review_2', 'review_3', 'audit_1', 'audit_2', 'audit_3'],
+        fixer: ['fix_1', 'fix_2', 'fix_3', 'repair_1', 'repair_2', 'repair_3', 'targeted_repair_1', 'targeted_repair_2', 'targeted_repair_3'],
+        qa: ['qa'],
+        archiver: ['archive'],
+        planning: ['planning'],
+      };
+      const fallbacks = roleFallbacks[role] || [];
+      for (const key of fallbacks) {
+        if (sessions[key]) {
+          sessionId = String(sessions[key]).trim();
+          break;
+        }
+      }
+    }
+    if (!sessionId) {
+      const childMatch = childSessions.find((session) => session.role === role || session.stageKey === role);
+      if (childMatch) {
+        sessionId = String(childMatch.id || '').trim();
+        sessionProvider = childMatch.provider || 'codex';
+      }
+    }
+    if (!sessionId) {
+      return null;
+    }
+
+    if (!isKnownProvider(sessionProvider)) {
+      return { label: label || sessionId, sessionId, provider: sessionProvider, unlinked: true };
+    }
+
+    const session = childSessions.find((entry) => entry.id === sessionId && (entry.provider || 'codex') === sessionProvider)
+      || childSessions.find((entry) => entry.id === sessionId);
+    if (session) {
+      return {
+        label: label || sessionId,
+        sessionId,
+        provider: sessionProvider || session.provider || 'codex',
+        stageKey: session.stageKey,
+        address: session.address,
+        routePath: session.routePath,
+      };
+    }
+    return {
+      label: label || sessionId,
+      sessionId,
+      provider: sessionProvider,
+      routePath: `/runs/${encodeURIComponent(state?.run_id || '')}/sessions/by-id/${encodeURIComponent(sessionId)}`,
+    };
+  }
+
+  const plannerSessionRef = resolvePlannerSessionRef(
+    sessions,
+    pick(state, 'workflow_config'),
+    childSessions,
+    pick(state, 'run_id'),
+  );
+
+  const paths = pick(state, 'paths') || {};
+  const hasAcceptanceStage = stages && typeof stages === 'object' && 'acceptance' in stages;
+  const hasAcceptanceSession = Object.keys(sessions && typeof sessions === 'object' ? sessions : {}).some((key) => {
+    const parsed = acceptedProviderFromSessionKey(key);
+    return parsed.accepted && (parsed.role === 'acceptance' || parsed.role === 'acceptor');
+  });
+  const hasAcceptanceArtifact = paths && typeof paths === 'object' && Object.keys(paths).some((key) => (
+    key === 'acceptance_summary' || key === 'acceptance' || /^acceptance/i.test(key)
+  ));
+  const showAcceptanceRow = hasAcceptanceStage || hasAcceptanceSession || hasAcceptanceArtifact;
+
+  const rows: WorkflowJsonRecord[] = [
+    {
+      key: 'planning',
+      label: 'Plan',
+      role: 'planning',
+      sessionRef: plannerSessionRef,
+      placeholder: plannerSessionRef ? undefined : 'Unknown',
+      checkCount: 0,
+    },
+  ];
+
+  if (showAcceptanceRow) {
+    rows.push({
+      key: 'acceptance',
+      label: 'Accept',
+      role: 'acceptance',
+      sessionRef: resolveSessionRef('acceptance', ''),
+      checkCount: acceptanceCount,
+    });
+  }
+
+  rows.push(
+    {
+      key: 'executor',
+      label: 'Execute',
+      role: 'executor',
+      sessionRef: resolveSessionRef('executor', ''),
+      checkCount: writeCount,
+    },
+    {
+      key: 'reviewer',
+      label: 'Review',
+      role: 'reviewer',
+      sessionRef: resolveSessionRef('reviewer', ''),
+      checkCount: reviewCount,
+    },
+    {
+      key: 'fixer',
+      label: 'Repair',
+      role: 'fixer',
+      sessionRef: resolveSessionRef('fixer', ''),
+      checkCount: fixCount,
+    },
+    {
+      key: 'qa',
+      label: 'Test',
+      role: 'qa',
+      sessionRef: resolveSessionRef('qa', ''),
+      checkCount: qaCount,
+    },
+    {
+      key: 'archiver',
+      label: 'Archive',
+      role: 'archiver',
+      sessionRef: resolveSessionRef('archiver', ''),
+      checkCount: archiveCount,
+    },
+  );
+
+  return { rows };
+}
+
+/**
+ * Build oz flow status/watch structured summary.
+ */
+export function buildWorkflowStatusSummary(
+  state: WorkflowState,
+  childSessions: SessionRef[],
+  artifacts: ArtifactRef[],
+  dagNodes: WorkflowJsonRecord,
+  hasPlanningArtifacts: boolean,
+): WorkflowJsonRecord {
+  const stages = pick(state, 'stages') || {};
+  const sessions = pick(state, 'sessions') || {};
+  const engine = String(pick(state, 'engine') || pick(state, 'workflow_config')?.engine || '').trim() || undefined;
+  const currentStage = String(pick(state, 'stage') || '').trim();
+
+  const evidenceStageKeys = new Set<string>();
+  for (const [stageKey, status] of Object.entries(stages && typeof stages === 'object' ? stages : {})) {
+    const normalizedStatus = String(status || '').toLowerCase();
+    if (!normalizedStatus || normalizedStatus === 'pending') {
+      continue;
+    }
+    evidenceStageKeys.add(stageKey);
+  }
+  if (currentStage) {
+    evidenceStageKeys.add(currentStage);
+  }
+  for (const childSession of childSessions || []) {
+    if (childSession.stageKey) evidenceStageKeys.add(childSession.stageKey);
+  }
+  for (const artifact of artifacts || []) {
+    if (artifact.stage && artifact.exists !== false) evidenceStageKeys.add(artifact.stage);
+  }
+  for (const [nodeId, nodeData] of Object.entries(dagNodes || {})) {
+    const nodeStatus = String((nodeData as WorkflowJsonRecord)?.status || '').toLowerCase();
+    if (!nodeStatus || nodeStatus === 'pending') {
+      continue;
+    }
+    if (/^(?:execution|review_\d+|audit_\d+|fix_\d+|repair_\d+|targeted_repair_\d+|qa(?:_\d+)?|archive)$/.test(nodeId)) {
+      evidenceStageKeys.add(nodeId);
+    }
+  }
+
+  /**
+   * Resolve a stage status from the same runtime evidence used to decide
+   * whether the stage exists in the oz flow status/watch summary.
+   */
+  function resolveRuntimeStageStatus(stageKey: string): string {
+    const stageStatus = String(stages?.[stageKey] || '').toLowerCase();
+    if (stageStatus && stageStatus !== 'pending') {
+      return stageStatus;
+    }
+    const dagStatus = String((dagNodes?.[stageKey] as WorkflowJsonRecord | undefined)?.status || '').toLowerCase();
+    if (dagStatus && dagStatus !== 'pending') {
+      return dagStatus;
+    }
+    const runStatus = String(pick(state, 'status') || '').toLowerCase();
+    if (stageKey === currentStage && isActiveStatus(runStatus)) {
+      return 'running';
+    }
+    return stageStatus || dagStatus;
+  }
+
+  const executionStages: string[] = [];
+  const reviewStages: string[] = [];
+  const fixStages: string[] = [];
+  const qaStages: string[] = [];
+  const archiveStages: string[] = [];
+
+  for (const stageKey of evidenceStageKeys) {
+    if (stageKey === 'execution') {
+      executionStages.push(stageKey);
+    } else if (parseReviewStage(stageKey)) {
+      reviewStages.push(stageKey);
+    } else if (parseFixStage(stageKey)) {
+      fixStages.push(stageKey);
+    } else if (stageKey === 'qa' || /^qa_\d+$/.test(stageKey)) {
+      qaStages.push(stageKey);
+    } else if (stageKey === 'archive') {
+      archiveStages.push(stageKey);
+    }
+  }
+
+  reviewStages.sort((left, right) => (parseReviewStage(left) || 0) - (parseReviewStage(right) || 0));
+  fixStages.sort((left, right) => (parseFixStage(left) || 0) - (parseFixStage(right) || 0));
+  qaStages.sort((left, right) => {
+    const leftMatch = left.match(/^qa(?:_(\d+))?$/);
+    const rightMatch = right.match(/^qa(?:_(\d+))?$/);
+    return (Number(leftMatch?.[1]) || 1) - (Number(rightMatch?.[1]) || 1);
+  });
+
+  function buildMarker(stageKeys: string[]): string {
+    return stageKeys.map((stageKey) => {
+      const status = resolveRuntimeStageStatus(stageKey);
+      return markerForStageStatus(stageKey, currentStage, status);
+    }).join('');
+  }
+
+  function isActive(stageKeys: string[]): boolean {
+    return stageKeys.some((stageKey) => {
+      const status = resolveRuntimeStageStatus(stageKey);
+      return stageKey === currentStage && isActiveStatus(status);
+    });
+  }
+
+  function isBlocked(stageKeys: string[]): boolean {
+    return stageKeys.some((stageKey) => {
+      const status = resolveRuntimeStageStatus(stageKey);
+      return isBlockedStatus(status);
+    });
+  }
+
+  function resolveSessionRef(role: string, stageKeys: string[] = []): { sessionId: string; provider: string } | null {
+    for (const [key, value] of Object.entries(sessions && typeof sessions === 'object' ? sessions : {})) {
+      const parsed = acceptedProviderFromSessionKey(key);
+      if (!parsed.accepted) {
+        continue;
+      }
+      if (parsed.role === role && value) {
+        return { sessionId: String(value).trim(), provider: parsed.provider };
+      }
+    }
+    for (const stageKey of stageKeys) {
+      const sessionId = String(sessions?.[stageKey] || '').trim();
+      if (sessionId) {
+        return { sessionId, provider: resolveSessionProviderFromState(sessionId, sessions) || 'codex' };
+      }
+    }
+    const childMatch = (childSessions || []).find((session) => Boolean(session.stageKey && stageKeys.includes(session.stageKey)));
+    if (childMatch?.id) {
+      return { sessionId: childMatch.id, provider: childMatch.provider || 'codex' };
+    }
+    return null;
+  }
+
+  function buildRow(key: string, label: string, role: string, stageKeys: string[]): WorkflowJsonRecord | null {
+    if (!stageKeys || stageKeys.length === 0) {
+      return null;
+    }
+    const sessionRef = resolveSessionRef(role, stageKeys);
+    return {
+      key,
+      label,
+      role,
+      sessionId: sessionRef?.sessionId,
+      provider: sessionRef?.provider,
+      stageKeys,
+      markerText: buildMarker(stageKeys),
+      count: stageKeys.length,
+      active: isActive(stageKeys),
+      blocked: isBlocked(stageKeys),
+    };
+  }
+
+  const plannerSessionRef = resolvePlannerSessionRef(
+    sessions,
+    pick(state, 'workflow_config'),
+    childSessions,
+    pick(state, 'run_id'),
+  );
+
+  /**
+   * Render planning progress from real docs first.
+   */
+  function buildPlanningMarker(): string {
+    if (hasPlanningArtifacts) return '✓';
+    const status = String(stages.planning || '').toLowerCase();
+    const marker = markerForStageStatus('planning', currentStage, status);
+    if (marker !== ' ') return marker;
+    return ' ';
+  }
+
+  const rows = [];
+  if (hasPlanningArtifacts || plannerSessionRef) {
+    rows.push({
+      key: 'planning',
+      label: 'Plan',
+      role: 'planning',
+      sessionId: plannerSessionRef?.sessionId,
+      provider: plannerSessionRef?.provider,
+      stageKeys: ['planning'],
+      markerText: buildPlanningMarker(),
+      count: 0,
+      active: currentStage === 'planning' && isActiveStatus(stages.planning),
+      blocked: isBlockedStatus(stages.planning),
+    });
+  }
+  const executorRow = buildRow('executor', 'Execute', 'executor', executionStages);
+  if (executorRow) rows.push(executorRow);
+  const reviewerRow = buildRow('reviewer', 'Review', 'reviewer', reviewStages);
+  if (reviewerRow) rows.push(reviewerRow);
+  const fixerRow = buildRow('fixer', 'Repair', 'fixer', fixStages);
+  if (fixerRow) rows.push(fixerRow);
+  const qaRow = buildRow('qa', 'Test', 'qa', qaStages);
+  if (qaRow) rows.push(qaRow);
+  const archiverRow = buildRow('archiver', 'Archive', 'archiver', archiveStages);
+  if (archiverRow) rows.push(archiverRow);
+
+  return {
+    source: { format: 'oz flow status/watch', runtimeOnly: true },
+    engine,
+    rows,
+  };
+}
+
+/**
+ * Read oz flow status duration values without forcing one runner schema.
+ */
+function getStageDurationText(state: WorkflowState, stageKey: string): string {
+  const durationMaps = [
+    pick(state, 'stage_durations'),
+    pick(state, 'stageDurations'),
+    pick(state, 'durations'),
+  ].filter((value) => value && typeof value === 'object');
+  for (const durationMap of durationMaps) {
+    const value = durationMap[stageKey];
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value.toFixed(2) : '';
+    }
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+  return '';
+}
+
+/**
+ * Build stage inspection read models.
+ */
+export function buildStageInspections(
+  state: WorkflowState,
+  stageStatuses: StageStatus[],
+  childSessions: SessionRef[],
+  artifacts: ArtifactRef[],
+  runnerError: string,
+  diagnostics: WorkflowJsonRecord,
+  workflowDag: WorkflowJsonRecord,
+): WorkflowJsonRecord[] {
+  const dagTargetsByStage = collectDagTargetsByStage(workflowDag);
+  return stageStatuses.map((stage) => {
+    const stageSessions = childSessions.filter((session) => session.stageKey === stage.key);
+    const stageArtifacts = artifacts.filter((artifact) => artifact.stage === stage.key);
+    const dagTargets = dagTargetsByStage.get(stage.key) || { sessions: [], artifacts: [] };
+    const mergedStageSessions = mergeStageSessions(stageSessions, dagTargets.sessions, stage.key);
+    const mergedStageArtifacts = mergeStageArtifacts(stageArtifacts, dagTargets.artifacts, stage.key, stage.status);
+    if (stage.key === 'archive' && !stageArtifacts.some((artifact) => artifact.type === 'delivery-summary')) {
+      mergedStageArtifacts.push({
+        id: 'delivery-summary:delivery-summary.md',
+        label: 'delivery-summary.md',
+        type: 'delivery-summary',
+        stage: 'archive',
+        relativePath: 'delivery-summary.md',
+        path: 'delivery-summary.md',
+        exists: false,
+      });
+    }
+    return {
+      stageKey: stage.key,
+      title: stage.label || stage.key,
+      status: stage.status,
+      durationText: getStageDurationText(state, stage.key),
+      provider: 'codex',
+      note: stage.status === 'blocked' ? runnerError || undefined : undefined,
+      warnings: (Array.isArray(diagnostics.warnings) ? diagnostics.warnings : []).map((message: string) => ({
+        type: 'runner_diagnostic',
+        stageKey: stage.key,
+        provider: 'codex',
+        message,
+      })),
+      recoveryEvents: [],
+      substages: [{
+        stageKey: stage.key,
+        substageKey: stage.key,
+        title: SUBSTAGE_TITLES[stage.key] || stage.label || stage.key,
+        status: stage.status,
+        summary: stage.status === 'blocked' ? runnerError || undefined : undefined,
+        files: mergedStageArtifacts,
+        agentSessions: mergedStageSessions,
+      }],
+    };
+  });
+}

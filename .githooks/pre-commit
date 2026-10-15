@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# PURPOSE: Run the repository CI gate before Git creates a commit.
+set -euo pipefail
+
+exec ./scripts/pre-commit.sh

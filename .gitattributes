@@ -1,0 +1,7 @@
+# Hide generated third-party runtimes in reviews; keep the integration bridge visible.
+public/vendor/plantuml/*/plantuml-browser.js linguist-generated=true
+public/vendor/plantuml/*/viz-global.js linguist-generated=true
+public/vendor/plantuml/*/themes.js linguist-generated=true
+public/vendor/plantuml/*/openiconic.js linguist-generated=true
+public/vendor/plantuml/*/emoji.js linguist-generated=true
+public/vendor/plantuml/*/*.min.js linguist-generated=true

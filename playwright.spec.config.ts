@@ -1,0 +1,26 @@
+/**
+ * PURPOSE: Dedicated Playwright configuration for OpenSpec acceptance tests,
+ * oz change contract tests, and explicitly targeted e2e acceptance specs.
+ * Reuses the main e2e fixture/bootstrap pipeline while keeping test discovery scoped.
+ */
+import baseConfig from './playwright.config.ts';
+
+process.env.AGENTPORCH_FAKE_RUNNER = process.env.AGENTPORCH_FAKE_RUNNER || '1';
+process.env.AGENTPORCH_FAKE_RUNNER_DELAY_MS = process.env.AGENTPORCH_FAKE_RUNNER_DELAY_MS || '8000';
+process.env.CODEX_INDEX_CACHE_TTL_MS = '0';
+process.env.PROJECTS_CACHE_TTL_MS = '0';
+
+export default {
+  ...baseConfig,
+  testDir: '.',
+  testMatch: [
+    'tests/spec/**/*.spec.ts',
+    'tests/e2e/**/*.spec.ts',
+    'docs/changes/**/tests/**/*.spec.ts',
+  ],
+  // Archived proposals carry historical paths and are not part of the active browser gate.
+  // Keep browser discovery available for active Playwright change tests only.
+  testIgnore: [
+    'docs/changes/archive/**',
+  ],
+};

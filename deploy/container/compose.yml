@@ -1,0 +1,29 @@
+services:
+  agentporch:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      HOST: 0.0.0.0
+      HERMES_HOME: /data/hermes
+      DATABASE_PATH: /var/lib/agentporch/agentporch.db
+      AGENTPORCH_TRUST_LOCALHOST_AUTH: "false"
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in your local environment file}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:?Set CREDENTIAL_ENCRYPTION_KEY in your local environment file}
+    ports:
+      - "127.0.0.1:${AGENTPORCH_PORT:-3001}:3001"
+    volumes:
+      - ${HERMES_DATA_DIR:?Set HERMES_DATA_DIR}:/data/hermes:ro
+      - ${WORKSPACE_DIR:?Set WORKSPACE_DIR}:/workspace
+      - agentporch-state:/var/lib/agentporch
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  agentporch-state:

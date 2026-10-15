@@ -1,0 +1,15 @@
+{
+  "upstream": "https://github.com/plantuml/plantuml",
+  "publishedRevision": "b0c5e6c978457b5e8e31c07565b63778bc4733c5",
+  "sourceRevision": "57a3d28484b643d4fd92ed788da983ac29d8866b",
+  "engineVersion": "1.2026.9beta4",
+  "transform": "esbuild 0.27.7: ESM to minified IIFE (globalName=PlantUML,target=es2020); second minify pass with supported.template-literal=false",
+  "sha256": {
+    "plantuml-browser.js": "ca288953450b8c95372ddf51d77432bbab86ff9088a2491d155b74bc11483895",
+    "viz-global.js": "ef2cd8a08b5cf8b65e3634131052b41870ff30bb6fb23e23a87fd09d44666cba",
+    "themes.js": "4df9039fe1f38bce984c7ed2b48bde6f385181a21112d8c4bacb9e9ffc99bc26",
+    "openiconic.js": "f0ba6c6ce4431e73a7e98ff35f374ed49a26572bb433f30b5c0848b890ded313",
+    "emoji.js": "29bc1feaf94d1570cf64621954e62c96537d740f9933a65bf69871ef306e5f24",
+    "c4.min.js": "6074a5b15fcd6dade1f0f1bd4426f2da7ff9006fb8ac762502df7351f4260b7c"
+  }
+}

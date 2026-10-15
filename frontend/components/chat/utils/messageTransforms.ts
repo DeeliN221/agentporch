@@ -1,0 +1,946 @@
+/**
+ * PURPOSE: Convert provider transcript records into renderable chat messages.
+ */
+import type { ChatMessage } from '../types/types';
+import { decodeHtmlEntities, unescapeWithMathProtection } from './chatFormatting';
+import { dedupeAdjacentChatMessages } from './messageDedup';
+import {
+  normalizeCodexFunctionCall,
+  normalizeCodexToolOutput,
+} from '../../../../shared/codex-message-normalizer.js';
+import { isSubagentToolCall } from '../../../../shared/subagent-tool-utils.js';
+import {
+  isProviderFileUpdatePayload,
+  resolveCodexToolUpdateJson,
+} from './providerPayloadParsers';
+
+export interface DiffLine {
+  type: 'added' | 'removed';
+  content: string;
+  lineNum: number;
+}
+
+export type DiffCalculator = (oldStr: string, newStr: string) => DiffLine[];
+
+type CursorBlob = {
+  id?: string;
+  sequence?: number;
+  rowid?: number;
+  content?: any;
+};
+
+const USER_UPLOAD_NOTE_MARKER = '[User uploaded files for this message]';
+function toCodexToolUpdateChatMessage(
+  value: unknown,
+  timestamp: string | number | Date,
+  messageKey: string | undefined,
+  clientRequestId: string | undefined,
+  provider?: string,
+  orderFields: Partial<ChatMessage> = {},
+): ChatMessage | null {
+  /**
+   * Convert leaked Codex tool update JSON into the same ChatMessage shape as
+   * tool_use/tool_result rows from the server read model.
+   */
+  const resolved = resolveCodexToolUpdateJson(value);
+  if (!resolved) {
+    return null;
+  }
+
+  const toolCallId = resolved.payload.call_id ?? resolved.payload.callId ?? resolved.payload.id;
+  const toolCallIdText = typeof toolCallId === 'string' ? toolCallId : undefined;
+  if (resolved.kind === 'tool_result') {
+    return {
+      type: 'assistant',
+      content: '',
+      timestamp,
+      provider,
+      messageKey,
+      clientRequestId,
+      ...orderFields,
+      isToolUse: true,
+      toolCallId: toolCallIdText,
+      toolId: toolCallIdText,
+      toolResult: {
+        content: normalizeCodexToolOutput(resolved.payload.output ?? resolved.payload.content ?? resolved.payload.result),
+        isError: Boolean(resolved.payload.error),
+      },
+    };
+  }
+
+  const normalized = normalizeCodexFunctionCall(resolved.payload);
+  const normalizedToolCallId = typeof normalized.toolCallId === 'string' ? normalized.toolCallId : undefined;
+  const isSubagentContainer = isSubagentToolCall(normalized.toolName, normalized.toolInput);
+  return {
+    type: 'assistant',
+    content: '',
+    timestamp,
+    provider,
+    messageKey,
+    clientRequestId,
+    ...orderFields,
+    isToolUse: true,
+    toolName: normalized.toolName,
+    toolInput: normalizeToolInput(normalized.toolInput),
+    toolCallId: normalizedToolCallId,
+    toolId: normalizedToolCallId,
+    toolResult: null,
+    isSubagentContainer,
+    subagentState: isSubagentContainer
+      ? {
+          childTools: [],
+          currentToolIndex: -1,
+          isComplete: false,
+        }
+      : undefined,
+  };
+}
+
+/**
+ * Remove provider-facing upload metadata from user-visible transcript text.
+ */
+function stripUserUploadNoteForDisplay(content: string): string {
+  const markerIndex = content.indexOf(USER_UPLOAD_NOTE_MARKER);
+  if (markerIndex < 0) {
+    return content;
+  }
+
+  return content.slice(0, markerIndex).trimEnd();
+}
+
+const PROVIDER_INTERNAL_USER_BLOCK_TAGS = ['environment_context', 'system-reminder', 'codex_internal_context'];
+const PROVIDER_AGENTS_INSTRUCTIONS_PATTERN = /^# AGENTS\.md instructions\s*\n+\s*<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>\s*/i;
+
+/**
+ * Remove provider bootstrap instructions from persisted user transcript text.
+ */
+function cleanProviderUserContent(content: string): string {
+  /**
+   * docstring: Provider history may replay AGENTS.md, environment, or goal
+   * control blocks as role=user rows; the browser shows only authored text.
+   */
+  let visible = content.trim();
+  if (!visible) {
+    return '';
+  }
+
+  let changed = true;
+  while (changed) {
+    const before = visible;
+    visible = visible.replace(PROVIDER_AGENTS_INSTRUCTIONS_PATTERN, '').trim();
+    PROVIDER_INTERNAL_USER_BLOCK_TAGS.forEach((tagName) => {
+      const leadingBlock = new RegExp(`^<${tagName}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${tagName}>\\s*`, 'i');
+      const trailingBlock = new RegExp(`\\s*<${tagName}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${tagName}>\\s*$`, 'i');
+      visible = visible.replace(leadingBlock, '').replace(trailingBlock, '').trim();
+    });
+    changed = visible !== before;
+  }
+
+  return visible;
+}
+
+/**
+ * Detect provider-facing user rows that must stay out of the visible transcript.
+ */
+function isProviderInternalUserContent(content: string): boolean {
+  /**
+   * Follow-up runs can replay injected context as role=user rows before the
+   * backend filter is available, so the browser adapter keeps a defensive
+   * allow-list of complete internal wrapper blocks.
+   */
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  return PROVIDER_INTERNAL_USER_BLOCK_TAGS.some((tagName) => {
+    const openTag = new RegExp(`^<${tagName}(?:\\s[^>]*)?>`, 'i');
+    const closeTag = new RegExp(`</${tagName}>\\s*$`, 'i');
+    return openTag.test(trimmed) && closeTag.test(trimmed);
+  });
+}
+
+/**
+ * Recover persisted upload metadata so refreshed user bubbles still show the
+ * attached files even though provider-facing instructions stay hidden.
+ */
+function parseUserUploadNoteAttachments(content: string): NonNullable<ChatMessage['attachments']> {
+  const markerIndex = content.indexOf(USER_UPLOAD_NOTE_MARKER);
+  if (markerIndex < 0) {
+    return [];
+  }
+
+  const attachments: NonNullable<ChatMessage['attachments']> = [];
+  content
+    .slice(markerIndex + USER_UPLOAD_NOTE_MARKER.length)
+    .split('\n')
+    .forEach((line) => {
+      const match = line.match(/^\s*\d+\.\s+(.+?)\s+->\s+(.+?)\s+\((.+?),\s+(\d+)\s+bytes\)\s*$/);
+      if (!match) {
+        return;
+      }
+      const relativePath = match[1].trim();
+      const absolutePath = match[2].trim();
+      const name = relativePath.split(/[\\/]/).filter(Boolean).pop() || absolutePath.split(/[\\/]/).filter(Boolean).pop() || 'upload';
+      attachments.push({
+        kind: 'file' as const,
+        name,
+        relativePath,
+        absolutePath,
+        mimeType: match[3].trim(),
+        size: Number(match[4]),
+      });
+    });
+  return attachments;
+}
+
+const asArray = <T>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
+
+const normalizeToolInput = (value: unknown): string => {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+};
+
+/**
+ * Keep optional timing metadata numeric after JSON transport normalization.
+ */
+const toOptionalNumber = (value: unknown): number | undefined => {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : undefined;
+};
+
+/**
+ * Detect Codex assistant phases that are process detail rather than final body.
+ */
+function isProcessAssistantPhase(phase: unknown): boolean {
+  /**
+   * docstring: Codex persists commentary as assistant text rows, but those rows
+   * are operational narration and must collapse with thinking/tool activity.
+   */
+  return phase === 'commentary' || phase === 'analysis' || phase === 'reasoning';
+}
+
+/**
+ * Convert Codex assistant text rows while preserving process phases so progress
+ * messages do not overwhelm the main assistant transcript.
+ */
+const toCodexAssistantChatMessage = (
+  content: string,
+  timestamp: string | number | Date,
+  messageKey: string | undefined,
+  clientRequestId: string | undefined,
+  phase: unknown,
+  provider?: string,
+  orderFields: Partial<ChatMessage> = {},
+): ChatMessage => {
+  const normalizedPhase = typeof phase === 'string' ? phase : undefined;
+  if (isProcessAssistantPhase(phase)) {
+    return {
+      type: 'assistant',
+      content,
+      timestamp,
+      phase: normalizedPhase,
+      provider,
+      messageKey,
+      clientRequestId,
+      ...orderFields,
+      isThinking: true,
+    };
+  }
+
+  return {
+    type: 'assistant',
+    content,
+    timestamp,
+    phase: normalizedPhase,
+    provider,
+    messageKey,
+    clientRequestId,
+    ...orderFields,
+  };
+};
+
+/**
+ * Convert tool outputs from mixed transport shapes into renderable text.
+ */
+const normalizeToolResultContent = (value: unknown): string => {
+  return normalizeCodexToolOutput(value);
+};
+
+const toAbsolutePath = (projectPath: string, filePath?: string) => {
+  if (!filePath) {
+    return filePath;
+  }
+  return filePath.startsWith('/') ? filePath : `${projectPath}/${filePath}`;
+};
+
+export const calculateDiff = (oldStr: string, newStr: string): DiffLine[] => {
+  const oldLines = oldStr.split('\n');
+  const newLines = newStr.split('\n');
+
+  // Use LCS alignment so insertions/deletions don't cascade into a full-file "changed" diff.
+  const lcsTable: number[][] = Array.from({ length: oldLines.length + 1 }, () =>
+    new Array<number>(newLines.length + 1).fill(0),
+  );
+  for (let oldIndex = oldLines.length - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = newLines.length - 1; newIndex >= 0; newIndex -= 1) {
+      if (oldLines[oldIndex] === newLines[newIndex]) {
+        lcsTable[oldIndex][newIndex] = lcsTable[oldIndex + 1][newIndex + 1] + 1;
+      } else {
+        lcsTable[oldIndex][newIndex] = Math.max(
+          lcsTable[oldIndex + 1][newIndex],
+          lcsTable[oldIndex][newIndex + 1],
+        );
+      }
+    }
+  }
+
+  const diffLines: DiffLine[] = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+
+  while (oldIndex < oldLines.length && newIndex < newLines.length) {
+    const oldLine = oldLines[oldIndex];
+    const newLine = newLines[newIndex];
+
+    if (oldLine === newLine) {
+      oldIndex += 1;
+      newIndex += 1;
+      continue;
+    }
+
+    if (lcsTable[oldIndex + 1][newIndex] >= lcsTable[oldIndex][newIndex + 1]) {
+      diffLines.push({ type: 'removed', content: oldLine, lineNum: oldIndex + 1 });
+      oldIndex += 1;
+      continue;
+    }
+
+    diffLines.push({ type: 'added', content: newLine, lineNum: newIndex + 1 });
+    newIndex += 1;
+  }
+
+  while (oldIndex < oldLines.length) {
+    diffLines.push({ type: 'removed', content: oldLines[oldIndex], lineNum: oldIndex + 1 });
+    oldIndex += 1;
+  }
+
+  while (newIndex < newLines.length) {
+    diffLines.push({ type: 'added', content: newLines[newIndex], lineNum: newIndex + 1 });
+    newIndex += 1;
+  }
+
+  return diffLines;
+};
+
+export const createCachedDiffCalculator = (): DiffCalculator => {
+  const cache = new Map<string, DiffLine[]>();
+
+  return (oldStr: string, newStr: string) => {
+    const key = JSON.stringify([oldStr, newStr]);
+    const cached = cache.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const calculated = calculateDiff(oldStr, newStr);
+    cache.set(key, calculated);
+    if (cache.size > 100) {
+      const firstKey = cache.keys().next().value;
+      if (firstKey) {
+        cache.delete(firstKey);
+      }
+    }
+    return calculated;
+  };
+};
+
+export const convertCursorSessionMessages = (blobs: CursorBlob[], projectPath: string): ChatMessage[] => {
+  const converted: ChatMessage[] = [];
+  const toolUseMap: Record<string, ChatMessage> = {};
+
+  for (let blobIdx = 0; blobIdx < blobs.length; blobIdx += 1) {
+    const blob = blobs[blobIdx];
+    const content = blob.content;
+    let text = '';
+    let role: ChatMessage['type'] = 'assistant';
+    let reasoningText: string | null = null;
+    let assistantPhase: string | undefined;
+    let isProcessAssistantMessage = false;
+
+    try {
+      if (content?.role && content?.content) {
+        if (content.role === 'system') {
+          continue;
+        }
+
+        if (content.role === 'tool') {
+          const toolItems = asArray<any>(content.content);
+          for (const item of toolItems) {
+            if (item?.type !== 'tool-result') {
+              continue;
+            }
+
+            const toolName = item.toolName === 'ApplyPatch' ? 'Edit' : item.toolName || 'Unknown Tool';
+            const toolCallId = item.toolCallId || content.id;
+            const result = item.result || '';
+
+            if (toolCallId && toolUseMap[toolCallId]) {
+              toolUseMap[toolCallId].toolResult = {
+                content: result,
+                isError: false,
+              };
+            } else {
+              converted.push({
+                type: 'assistant',
+                content: '',
+                timestamp: new Date(Date.now() + blobIdx * 1000),
+                blobId: blob.id,
+                sequence: blob.sequence,
+                rowid: blob.rowid,
+                isToolUse: true,
+                toolName,
+                toolId: toolCallId,
+                toolInput: normalizeToolInput(null),
+                toolResult: {
+                  content: result,
+                  isError: false,
+                },
+              });
+            }
+          }
+          continue;
+        }
+
+        role = content.role === 'user' ? 'user' : 'assistant';
+        assistantPhase = typeof content.phase === 'string' ? content.phase : undefined;
+        isProcessAssistantMessage = role === 'assistant' && isProcessAssistantPhase(assistantPhase);
+
+        if (Array.isArray(content.content)) {
+          const textParts: string[] = [];
+
+          for (const part of content.content) {
+            if (part?.type === 'text' && part?.text) {
+              textParts.push(decodeHtmlEntities(part.text));
+              continue;
+            }
+
+            if (part?.type === 'reasoning' && part?.text) {
+              reasoningText = decodeHtmlEntities(part.text);
+              continue;
+            }
+
+            if (part?.type === 'tool-call' || part?.type === 'tool_use') {
+              if (textParts.length > 0 || reasoningText) {
+                converted.push({
+                  type: role,
+                  content: textParts.join('\n'),
+                  reasoning: reasoningText ?? undefined,
+                  timestamp: new Date(Date.now() + blobIdx * 1000),
+                  blobId: blob.id,
+                  sequence: blob.sequence,
+                  rowid: blob.rowid,
+                  phase: assistantPhase,
+                  ...(isProcessAssistantMessage ? { isThinking: true } : {}),
+                });
+                textParts.length = 0;
+                reasoningText = null;
+              }
+
+              const toolNameRaw = part.toolName || part.name || 'Unknown Tool';
+              const toolName = toolNameRaw === 'ApplyPatch' ? 'Edit' : toolNameRaw;
+              const toolId = part.toolCallId || part.id || `tool_${blobIdx}`;
+              let toolInput = part.args || part.input;
+
+              if (toolName === 'Edit' && part.args) {
+                if (part.args.patch) {
+                  const patchLines = String(part.args.patch).split('\n');
+                  const oldLines: string[] = [];
+                  const newLines: string[] = [];
+                  let inPatch = false;
+
+                  patchLines.forEach((line) => {
+                    if (line.startsWith('@@')) {
+                      inPatch = true;
+                      return;
+                    }
+                    if (!inPatch) {
+                      return;
+                    }
+
+                    if (line.startsWith('-')) {
+                      oldLines.push(line.slice(1));
+                    } else if (line.startsWith('+')) {
+                      newLines.push(line.slice(1));
+                    } else if (line.startsWith(' ')) {
+                      oldLines.push(line.slice(1));
+                      newLines.push(line.slice(1));
+                    }
+                  });
+
+                  toolInput = {
+                    file_path: toAbsolutePath(projectPath, part.args.file_path),
+                    old_string: oldLines.join('\n') || part.args.patch,
+                    new_string: newLines.join('\n') || part.args.patch,
+                  };
+                } else {
+                  toolInput = part.args;
+                }
+              } else if (toolName === 'Read' && part.args) {
+                const filePath = part.args.path || part.args.file_path;
+                toolInput = {
+                  file_path: toAbsolutePath(projectPath, filePath),
+                };
+              } else if (toolName === 'Write' && part.args) {
+                const filePath = part.args.path || part.args.file_path;
+                toolInput = {
+                  file_path: toAbsolutePath(projectPath, filePath),
+                  content: part.args.contents || part.args.content,
+                };
+              }
+
+              const toolMessage: ChatMessage = {
+                type: 'assistant',
+                content: '',
+                timestamp: new Date(Date.now() + blobIdx * 1000),
+                blobId: blob.id,
+                sequence: blob.sequence,
+                rowid: blob.rowid,
+                isToolUse: true,
+                toolName,
+                toolId,
+                toolInput: normalizeToolInput(toolInput),
+                toolResult: null,
+              };
+              converted.push(toolMessage);
+              toolUseMap[toolId] = toolMessage;
+              continue;
+            }
+
+            if (typeof part === 'string') {
+              textParts.push(part);
+            }
+          }
+
+          if (textParts.length > 0) {
+            text = textParts.join('\n');
+            if (reasoningText && !text) {
+              converted.push({
+                type: role,
+                content: '',
+                reasoning: reasoningText,
+                timestamp: new Date(Date.now() + blobIdx * 1000),
+                blobId: blob.id,
+                sequence: blob.sequence,
+                rowid: blob.rowid,
+              });
+              text = '';
+            }
+          } else {
+            text = '';
+          }
+        } else if (typeof content.content === 'string') {
+          text = content.content;
+        }
+      } else if (content?.message?.role && content?.message?.content) {
+        if (content.message.role === 'system') {
+          continue;
+        }
+
+        role = content.message.role === 'user' ? 'user' : 'assistant';
+        assistantPhase = typeof content.message.phase === 'string'
+          ? content.message.phase
+          : (typeof content.phase === 'string' ? content.phase : undefined);
+        isProcessAssistantMessage = role === 'assistant' && isProcessAssistantPhase(assistantPhase);
+        if (Array.isArray(content.message.content)) {
+          text = content.message.content
+            .map((part: any) => (typeof part === 'string' ? part : part?.text || ''))
+            .filter(Boolean)
+            .join('\n');
+        } else if (typeof content.message.content === 'string') {
+          text = content.message.content;
+        }
+      }
+    } catch (error) {
+      console.log('Error parsing blob content:', error);
+    }
+
+    if (text && text.trim()) {
+      const message: ChatMessage = {
+        type: role,
+        content: text,
+        timestamp: new Date(Date.now() + blobIdx * 1000),
+        blobId: blob.id,
+        sequence: blob.sequence,
+        rowid: blob.rowid,
+        phase: assistantPhase,
+        ...(isProcessAssistantMessage ? { isThinking: true } : {}),
+      };
+      if (reasoningText) {
+        message.reasoning = reasoningText;
+      }
+      converted.push(message);
+    }
+  }
+
+  converted.sort((messageA, messageB) => {
+    if (messageA.sequence !== undefined && messageB.sequence !== undefined) {
+      return Number(messageA.sequence) - Number(messageB.sequence);
+    }
+    if (messageA.rowid !== undefined && messageB.rowid !== undefined) {
+      return Number(messageA.rowid) - Number(messageB.rowid);
+    }
+    return new Date(messageA.timestamp).getTime() - new Date(messageB.timestamp).getTime();
+  });
+
+  return converted;
+};
+
+export const convertSessionMessages = (rawMessages: any[]): ChatMessage[] => {
+  const converted: ChatMessage[] = [];
+  const toolResults = new Map<
+    string,
+    { content: unknown; isError: boolean; timestamp: Date; toolUseResult: unknown; subagentTools?: unknown[] }
+  >();
+
+  const getClientRequestId = (message: any) =>
+    typeof message?.clientRequestId === 'string'
+      ? message.clientRequestId
+      : (typeof message?.requestId === 'string' ? message.requestId : undefined);
+  const getStoredOrderFields = (message: any): Partial<ChatMessage> => ({
+    ...(message.sequence !== undefined ? { sequence: message.sequence } : {}),
+    ...(message.rowid !== undefined ? { rowid: message.rowid } : {}),
+    ...(typeof message.model === 'string' ? { model: message.model } : {}),
+    ...(message.tokenUsage && typeof message.tokenUsage === 'object'
+      ? { tokenUsage: message.tokenUsage }
+      : {}),
+  });
+
+  rawMessages.forEach((message) => {
+    if (message.message?.role === 'user' && Array.isArray(message.message?.content)) {
+      message.message.content.forEach((part: any) => {
+        if (part.type !== 'tool_result') {
+          return;
+        }
+        toolResults.set(part.tool_use_id, {
+          content: part.content,
+          isError: Boolean(part.is_error),
+          timestamp: new Date(message.timestamp || Date.now()),
+          toolUseResult: message.toolUseResult || null,
+          subagentTools: message.subagentTools,
+        });
+      });
+    }
+  });
+
+  rawMessages.forEach((message) => {
+    if (message.isTaskNotification) {
+      const notificationContent = typeof message.content === 'string'
+        ? message.content
+        : (typeof message.message?.content === 'string' ? message.message.content : '');
+      converted.push({
+        type: 'assistant',
+        content: unescapeWithMathProtection(notificationContent),
+        timestamp: message.timestamp || new Date().toISOString(),
+        provider: message.provider,
+        messageKey: message.messageKey,
+        clientRequestId: getClientRequestId(message),
+        ...getStoredOrderFields(message),
+        isTaskNotification: true,
+        taskStatus: typeof message.taskStatus === 'string' ? message.taskStatus : undefined,
+        taskKind: typeof message.taskKind === 'string' ? message.taskKind : undefined,
+        completedAt: message.completedAt,
+        durationMs: toOptionalNumber(message.durationMs),
+        timeToFirstTokenMs: toOptionalNumber(message.timeToFirstTokenMs),
+      });
+      return;
+    }
+
+    if (message.message?.role === 'user' && message.message?.content) {
+      let content = '';
+      if (Array.isArray(message.message.content)) {
+        const textParts: string[] = [];
+        message.message.content.forEach((part: any) => {
+          if (part.type === 'text') {
+            textParts.push(decodeHtmlEntities(part.text));
+          }
+        });
+        content = textParts.join('\n');
+      } else if (typeof message.message.content === 'string') {
+        content = decodeHtmlEntities(message.message.content);
+      } else {
+        content = decodeHtmlEntities(String(message.message.content));
+      }
+
+      const displayContent = cleanProviderUserContent(stripUserUploadNoteForDisplay(content));
+      const parsedAttachments = parseUserUploadNoteAttachments(content);
+      const shouldSkip =
+        (!displayContent && parsedAttachments.length === 0) ||
+        isProviderInternalUserContent(displayContent) ||
+        displayContent.startsWith('<command-name>') ||
+        displayContent.startsWith('<command-message>') ||
+        displayContent.startsWith('<command-args>') ||
+        displayContent.startsWith('<local-command-stdout>') ||
+        displayContent.startsWith('<system-reminder>') ||
+        displayContent.startsWith('Caveat:') ||
+        displayContent.startsWith('This session is being continued from a previous') ||
+        displayContent.startsWith('[Request interrupted');
+
+      if (!shouldSkip) {
+        // Parse <task-notification> blocks into compact system messages
+        const taskNotifRegex = /<task-notification>\s*<task-id>[^<]*<\/task-id>\s*<output-file>[^<]*<\/output-file>\s*<status>([^<]*)<\/status>\s*<summary>([^<]*)<\/summary>\s*<\/task-notification>/g;
+        const taskNotifMatch = taskNotifRegex.exec(content);
+        if (taskNotifMatch) {
+          const status = taskNotifMatch[1]?.trim() || 'completed';
+          const summary = taskNotifMatch[2]?.trim() || 'Background task finished';
+          converted.push({
+            type: 'assistant',
+            content: summary,
+            timestamp: message.timestamp || new Date().toISOString(),
+            provider: message.provider,
+            messageKey: message.messageKey,
+            clientRequestId: getClientRequestId(message),
+            ...getStoredOrderFields(message),
+            isTaskNotification: true,
+            taskStatus: status,
+          });
+        } else {
+          converted.push({
+            type: 'user',
+            content: unescapeWithMathProtection(displayContent),
+            timestamp: message.timestamp || new Date().toISOString(),
+            provider: message.provider,
+            messageKey: message.messageKey,
+            clientRequestId: getClientRequestId(message),
+            turnAnchorKey: typeof message.turnAnchorKey === 'string' ? message.turnAnchorKey : undefined,
+            ...getStoredOrderFields(message),
+            ...(parsedAttachments.length > 0 ? { attachments: parsedAttachments } : {}),
+            deliveryStatus: 'persisted',
+          });
+        }
+      }
+      return;
+    }
+
+    if (message.type === 'thinking' && message.message?.content) {
+      converted.push({
+        type: 'assistant',
+        content: unescapeWithMathProtection(message.message.content),
+        timestamp: message.timestamp || new Date().toISOString(),
+        provider: message.provider,
+        messageKey: message.messageKey,
+        clientRequestId: getClientRequestId(message),
+        ...getStoredOrderFields(message),
+        isThinking: true,
+      });
+      return;
+    }
+
+    if (message.type === 'tool_use' && message.toolName) {
+      const isSubagentContainer = isSubagentToolCall(message.toolName, message.toolInput);
+      converted.push({
+        type: 'assistant',
+        content: '',
+        timestamp: message.timestamp || new Date().toISOString(),
+        provider: message.provider,
+        messageKey: message.messageKey,
+        clientRequestId: getClientRequestId(message),
+        ...getStoredOrderFields(message),
+        isToolUse: true,
+        toolName: message.toolName,
+        toolInput: normalizeToolInput(message.toolInput),
+        toolCallId: message.toolCallId,
+        toolId: message.toolCallId,
+        status: message.status,  // Preserve running/streaming status so
+                                 // MessageComponent's isRunningTool check works
+        isSubagentContainer,
+        subagentState: isSubagentContainer
+          ? {
+              childTools: [],
+              currentToolIndex: -1,
+              isComplete: false,
+            }
+          : undefined,
+      });
+      return;
+    }
+
+    if (message.type === 'tool_result') {
+      for (let index = converted.length - 1; index >= 0; index -= 1) {
+        const convertedMessage = converted[index];
+        if (!convertedMessage.isToolUse || convertedMessage.toolResult) {
+          continue;
+        }
+        if (!message.toolCallId || convertedMessage.toolCallId === message.toolCallId) {
+          convertedMessage.toolResult = {
+            content: normalizeToolResultContent(message.output),
+            isError: false,
+          };
+          if (
+            isSubagentToolCall(convertedMessage.toolName, convertedMessage.toolInput) &&
+            Array.isArray(message.subagentTools)
+          ) {
+            const childTools = message.subagentTools.map((tool: any) => ({
+              toolId: tool.toolId,
+              toolName: tool.toolName,
+              toolInput: tool.toolInput,
+              toolResult: tool.toolResult || null,
+              timestamp: new Date(tool.timestamp || message.timestamp || Date.now()),
+            }));
+            convertedMessage.isSubagentContainer = true;
+            convertedMessage.subagentState = {
+              childTools,
+              currentToolIndex: childTools.length > 0 ? childTools.length - 1 : -1,
+              isComplete: true,
+            };
+          }
+          break;
+        }
+      }
+      return;
+    }
+
+    if (message.message?.role === 'assistant' && message.message?.content) {
+      if (Array.isArray(message.message.content)) {
+        let partIndex = 0;
+        const nextPartMessageKey = () => {
+          if (typeof message.messageKey !== 'string' || !message.messageKey) {
+            return undefined;
+          }
+
+          const nextKey = partIndex === 0 ? message.messageKey : `${message.messageKey}:msg:${partIndex}`;
+          partIndex += 1;
+          return nextKey;
+        };
+
+        message.message.content.forEach((part: any) => {
+          if (part.type === 'text') {
+            let text = part.text;
+            if (typeof text === 'string') {
+              text = unescapeWithMathProtection(text);
+            }
+            if (isProviderFileUpdatePayload(text)) {
+              return;
+            }
+            const toolUpdateMessage = toCodexToolUpdateChatMessage(
+              text,
+              message.timestamp || new Date().toISOString(),
+              part.messageKey || nextPartMessageKey(),
+              getClientRequestId(message),
+              message.provider,
+              getStoredOrderFields(message),
+            );
+            if (toolUpdateMessage) {
+              converted.push(toolUpdateMessage);
+              return;
+            }
+            converted.push(
+              toCodexAssistantChatMessage(
+                text,
+                message.timestamp || new Date().toISOString(),
+                part.messageKey || nextPartMessageKey(),
+                getClientRequestId(message),
+                message.message?.phase,
+                message.provider,
+                getStoredOrderFields(message),
+              ),
+            );
+            return;
+          }
+
+          if (part.type === 'tool_use') {
+            const toolResult = toolResults.get(part.id);
+            const isSubagentContainer = isSubagentToolCall(part.name, part.input);
+
+            // Build child tools from server-provided subagentTools data
+            const childTools: import('../types/types').SubagentChildTool[] = [];
+            if (isSubagentContainer && toolResult?.subagentTools && Array.isArray(toolResult.subagentTools)) {
+              for (const tool of toolResult.subagentTools as any[]) {
+                childTools.push({
+                  toolId: tool.toolId,
+                  toolName: tool.toolName,
+                  toolInput: tool.toolInput,
+                  toolResult: tool.toolResult || null,
+                  timestamp: new Date(tool.timestamp || Date.now()),
+                });
+              }
+            }
+
+            converted.push({
+              type: 'assistant',
+              content: '',
+              timestamp: message.timestamp || new Date().toISOString(),
+              provider: message.provider,
+              messageKey: part.messageKey || nextPartMessageKey(),
+              clientRequestId: getClientRequestId(message),
+              ...getStoredOrderFields(message),
+              isToolUse: true,
+              toolName: part.name,
+              toolInput: normalizeToolInput(part.input),
+              toolId: part.id,
+              toolResult: toolResult
+                ? {
+                    content: normalizeToolResultContent(toolResult.content),
+                    isError: toolResult.isError,
+                    toolUseResult: toolResult.toolUseResult,
+                  }
+                : null,
+              toolError: toolResult?.isError || false,
+              toolResultTimestamp: toolResult?.timestamp || new Date(),
+              isSubagentContainer,
+              subagentState: isSubagentContainer
+                ? {
+                    childTools,
+                    currentToolIndex: childTools.length > 0 ? childTools.length - 1 : -1,
+                    isComplete: Boolean(toolResult),
+                  }
+                : undefined,
+            });
+          }
+        });
+        return;
+      }
+
+      if (typeof message.message.content === 'string') {
+        if (isProviderFileUpdatePayload(message.message.content)) {
+          return;
+        }
+        const toolUpdateMessage = toCodexToolUpdateChatMessage(
+          message.message.content,
+          message.timestamp || new Date().toISOString(),
+          message.messageKey,
+          getClientRequestId(message),
+          message.provider,
+          getStoredOrderFields(message),
+        );
+        if (toolUpdateMessage) {
+          converted.push(toolUpdateMessage);
+          return;
+        }
+        converted.push(
+          toCodexAssistantChatMessage(
+            unescapeWithMathProtection(message.message.content),
+            message.timestamp || new Date().toISOString(),
+            message.messageKey,
+            getClientRequestId(message),
+            message.message?.phase,
+            message.provider,
+            getStoredOrderFields(message),
+          ),
+        );
+      }
+    }
+  });
+
+  return dedupeAdjacentChatMessages(converted) as ChatMessage[];
+};

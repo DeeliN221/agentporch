@@ -1,0 +1,987 @@
+// @ts-nocheck -- Test isolation: strict types deferred. Tracked for incremental tightening.
+/**
+ * PURPOSE: Verify Codex session message reads support incremental afterLine fetches
+ * so realtime project updates do not re-append the full session history.
+ */
+
+import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+
+import {
+  addProjectManually,
+  clearProjectDirectoryCache,
+  getCodexSessionMessages,
+  getProjects,
+} from '../../backend/projects.ts';
+
+/**
+ * Run each test inside an isolated HOME tree so Codex session fixtures stay local.
+ */
+async function withTemporaryHome(testBody) {
+  const originalHome = process.env.HOME;
+  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'agentporch-codex-messages-'));
+
+  process.env.HOME = tempHome;
+  try {
+    await testBody(tempHome);
+  } finally {
+    if (originalHome) {
+      process.env.HOME = originalHome;
+    } else {
+      delete process.env.HOME;
+    }
+
+    await fs.rm(tempHome, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Write a minimal Codex session file with multiline commands and mixed output shapes.
+ */
+async function createCodexSessionFixture(homeDir, sessionId) {
+  const sessionsDir = path.join(homeDir, '.codex', 'sessions', '2026', '04', '10');
+  const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+
+  await fs.mkdir(sessionsDir, { recursive: true });
+  await fs.writeFile(
+    sessionFile,
+    [
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-10T08:00:00.000Z',
+        payload: {
+          type: 'function_call',
+          name: 'shell_command',
+          call_id: 'call_1',
+          arguments: JSON.stringify({ command: 'pwd' }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-10T08:00:01.000Z',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call_1',
+          output: '/tmp/demo',
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-10T08:00:02.000Z',
+        payload: {
+          type: 'function_call',
+          name: 'shell_command',
+          call_id: 'call_2',
+          arguments: JSON.stringify({ command: 'printf "alpha\\nbeta\\n"' }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-10T08:00:03.000Z',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call_2',
+          output: {
+            content: [
+              { text: 'alpha' },
+              { text: 'beta' },
+            ],
+          },
+        },
+      }),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+}
+
+/**
+ * Write a Codex session file with assistant phase metadata so UI adapters can
+ * distinguish commentary progress from final answers.
+ */
+async function createCodexPhaseFixture(homeDir, sessionId) {
+  const sessionsDir = path.join(homeDir, '.codex', 'sessions', '2026', '04', '11');
+  const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+
+  await fs.mkdir(sessionsDir, { recursive: true });
+  await fs.writeFile(
+    sessionFile,
+    [
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-11T08:00:00.000Z',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: '先继续排查路由映射。' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-11T08:00:01.000Z',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '根因已经确认。' }],
+        },
+      }),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+}
+
+/**
+ * Write a Codex session file with the native task_complete event emitted when
+ * a long-running agent goal has finished.
+ */
+async function createCodexTaskCompleteFixture(homeDir, sessionId, options = {}) {
+  const sessionsDir = path.join(homeDir, '.codex', 'sessions', '2026', '06', '22');
+  const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+  const { includeGoalUpdate = true } = options;
+  const turnId = '019eef5c-245b-7802-9696-1a51a6956a89';
+  const finalAnswer = [
+    '**需求/问题**',
+    '',
+    '已创建一个覆盖四类需求的 oz 提案。',
+    '',
+    '**成果**',
+    '',
+    '契约Test已跑。',
+  ].join('\n');
+
+  await fs.mkdir(sessionsDir, { recursive: true });
+  const lines = [
+    {
+      type: 'session_meta',
+      timestamp: '2026-06-22T12:44:13.000Z',
+      payload: {
+        id: sessionId,
+        cwd: '/tmp/agentporch-goal-complete-project',
+        model: 'gpt-5',
+      },
+    },
+    {
+      type: 'response_item',
+      timestamp: '2026-06-22T12:52:31.802Z',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{
+          type: 'output_text',
+          text: finalAnswer,
+        }],
+      },
+    },
+  ];
+
+  if (includeGoalUpdate) {
+    lines.push(
+      {
+        type: 'response_item',
+        timestamp: '2026-06-22T12:52:31.801Z',
+        payload: {
+          type: 'function_call',
+          name: 'update_goal',
+          call_id: 'call-goal-complete',
+          arguments: JSON.stringify({ status: 'complete' }),
+          metadata: { turn_id: turnId },
+        },
+      },
+      {
+        type: 'response_item',
+        timestamp: '2026-06-22T12:52:31.802Z',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-goal-complete',
+          output: JSON.stringify({
+            goal: {
+              threadId: sessionId,
+              objective: '完成一个真实 /goal 任务',
+              status: 'complete',
+            },
+          }),
+        },
+      },
+    );
+  }
+
+  lines.push({
+    type: 'event_msg',
+    timestamp: '2026-06-22T12:52:31.803Z',
+    payload: {
+      type: 'task_complete',
+      turn_id: turnId,
+      last_agent_message: finalAnswer,
+      completed_at: 1782132751,
+      duration_ms: 498014,
+      time_to_first_token_ms: 3902,
+    },
+  });
+
+  await fs.writeFile(
+    sessionFile,
+    `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`,
+    'utf8',
+  );
+}
+
+/**
+ * Write a Codex session file where app-server persisted an update envelope
+ * around a functionCall item.
+ */
+async function createCodexUpdateFunctionCallFixture(homeDir, sessionId) {
+  const sessionsDir = path.join(homeDir, '.codex', 'sessions', '2026', '04', '12');
+  const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+
+  await fs.mkdir(sessionsDir, { recursive: true });
+  await fs.writeFile(
+    sessionFile,
+    [
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-12T08:00:00.000Z',
+        payload: {
+          type: 'update',
+          update: {
+            type: 'functionCall',
+            id: 'call-update-plan-jsonl',
+            name: 'update_plan',
+            arguments: {
+              explanation: 'JSONL update envelope must replay as a tool card',
+              plan: [{ step: 'Replay update_plan', status: 'completed' }],
+            },
+          },
+        },
+      }),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+}
+
+/**
+ * Write a Codex session file with custom user prompts so project listing can derive summaries.
+ */
+async function createCodexSummaryFixture(homeDir, sessionId, projectPath, prompts, options = {}) {
+  const { baseTimestamp = '2026-04-20T08:00:00.000Z' } = options;
+  const sessionsDir = path.join(homeDir, '.codex', 'sessions', '2026', '04', '20');
+  const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+
+  await fs.mkdir(sessionsDir, { recursive: true });
+  const lines = [
+    JSON.stringify({
+      type: 'session_meta',
+      timestamp: baseTimestamp,
+      payload: {
+        id: sessionId,
+        cwd: projectPath,
+        model: 'gpt-5',
+      },
+    }),
+    ...prompts.map((prompt, index) => JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(new Date(baseTimestamp).getTime() + (index + 1) * 1000).toISOString(),
+      payload: {
+        type: 'user_message',
+        message: prompt,
+      },
+    })),
+  ];
+  await fs.writeFile(sessionFile, `${lines.join('\n')}\n`, 'utf8');
+}
+
+test('getCodexSessionMessages returns only new mapped messages when afterLine is provided', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-after-line-session';
+    await createCodexSessionFixture(tempHome, sessionId);
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, 2);
+
+    assert.equal(result.total, 4);
+    assert.equal(result.hasMore, false);
+    assert.equal(result.messages.length, 2);
+    assert.equal(result.messages[0].type, 'tool_use');
+    assert.equal(result.messages[0].toolCallId, 'call_2');
+    assert.equal(result.messages[1].type, 'tool_result');
+    assert.equal(result.messages[1].toolCallId, 'call_2');
+    assert.match(result.messages[0].toolInput, /alpha\\\\nbeta\\\\n/);
+    assert.equal(result.messages[1].output, 'alpha\nbeta');
+  });
+});
+
+test('getCodexSessionMessages maps Codex update functionCall envelopes to tool_use', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-update-function-call-session';
+    await createCodexUpdateFunctionCallFixture(tempHome, sessionId);
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].type, 'tool_use');
+    assert.equal(result.messages[0].toolName, 'update_plan');
+    assert.equal(result.messages[0].toolCallId, 'call-update-plan-jsonl');
+    assert.match(JSON.stringify(result.messages[0].toolInput), /Replay update_plan/);
+    assert.ok(
+      !JSON.stringify(result.messages).includes('"type":"update"'),
+      'Codex update envelope must not leak to the frontend as raw JSON',
+    );
+  });
+});
+
+test('getCodexSessionMessages maps Codex task_complete events to goal completion notifications', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-task-complete-session';
+    await createCodexTaskCompleteFixture(tempHome, sessionId);
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+    const completion = result.messages.find((message) => message.taskKind === 'goal_complete');
+
+    assert.ok(completion, 'task_complete must become a visible goal completion notification');
+    assert.equal(completion.type, 'assistant');
+    assert.equal(completion.isTaskNotification, true);
+    assert.equal(completion.taskStatus, 'completed');
+    assert.equal(completion.content, '已创建一个覆盖四类需求的 oz 提案。');
+    assert.equal(completion.durationMs, 498014);
+    assert.equal(completion.timeToFirstTokenMs, 3902);
+    assert.equal(completion.completedAt, '2026-06-22T12:52:31.000Z');
+    assert.equal(result.messages.filter((message) => message.taskKind === 'goal_complete').length, 1);
+  });
+});
+
+test('getCodexSessionMessages does not map ordinary Codex task_complete events to goal completion notifications', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-ordinary-task-complete-session';
+    await createCodexTaskCompleteFixture(tempHome, sessionId, { includeGoalUpdate: false });
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+
+    assert.equal(result.messages.some((message) => message.taskKind === 'goal_complete'), false);
+    assert.equal(result.messages.some((message) => message.isTaskNotification), false);
+    assert.equal(result.messages.filter((message) => message.type === 'assistant').length, 1);
+  });
+});
+
+test('getCodexSessionMessages collapses duplicated Codex user echo records', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-duplicate-user-echo';
+    const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '04', '30');
+    const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+    const prompt = '把工作区的stage变更合并到 02080295 这个commit里';
+
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-04-30T03:40:29.604Z',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: prompt }],
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          timestamp: '2026-04-30T03:40:29.605Z',
+          payload: {
+            type: 'user_message',
+            message: prompt,
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-04-30T03:40:30.604Z',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: '已处理' }],
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+
+    assert.equal(result.messages.filter((message) => message.type === 'user').length, 1);
+    assert.equal(result.messages.length, 2);
+  });
+});
+
+test('getCodexSessionMessages hides Codex environment context user rows', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-environment-context-hidden';
+    const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '06', '22');
+    const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+    const prompt = '续发真实用户需求，环境上下文不应显示';
+    const environmentContext = [
+      '<environment_context>',
+      '<current_date>2026-06-22</current_date>',
+      '<timezone>Asia/Makassar</timezone>',
+      '<filesystem><workspace_roots><root>/home/example/projects/agentporch</root></workspace_roots></filesystem>',
+      '</environment_context>',
+    ].join('\n');
+
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-06-22T03:22:21.000Z',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: prompt }],
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          timestamp: '2026-06-22T03:22:21.002Z',
+          payload: {
+            type: 'user_message',
+            message: prompt,
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-06-22T03:22:23.000Z',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: environmentContext }],
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          timestamp: '2026-06-22T03:22:23.001Z',
+          payload: {
+            type: 'user_message',
+            message: environmentContext,
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+    const userMessages = result.messages.filter((message) => message.type === 'user');
+
+    assert.equal(userMessages.length, 1);
+    assert.equal(userMessages[0].message.content, prompt);
+    assert.equal(JSON.stringify(result.messages).includes('<environment_context>'), false);
+  });
+});
+
+test('getCodexSessionMessages hides Codex AGENTS bootstrap before the first user request', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-agents-bootstrap-hidden';
+    const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '06', '22');
+    const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+    const prompt = '这是用户真正发送的第一条需求';
+    const agentsBootstrap = [
+      '# AGENTS.md instructions',
+      '',
+      '<INSTRUCTIONS>',
+      '# KISS',
+      '',
+      '- 回答问题但没修改代码时，按"问、答"格式写；',
+      '- 使用rtk前缀Executionshell命令',
+      '</INSTRUCTIONS>',
+    ].join('\n');
+    const environmentContext = [
+      '<environment_context>',
+      '<cwd>/home/example/projects/agentporch</cwd>',
+      '<timezone>Asia/Makassar</timezone>',
+      '</environment_context>',
+    ].join('\n');
+
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-06-22T03:20:00.000Z',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: agentsBootstrap },
+              { type: 'input_text', text: environmentContext },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-06-22T03:20:01.000Z',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: prompt }],
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          timestamp: '2026-06-22T03:20:01.001Z',
+          payload: {
+            type: 'user_message',
+            message: prompt,
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+    const userMessages = result.messages.filter((message) => message.type === 'user');
+    const serialized = JSON.stringify(result.messages);
+
+    assert.equal(userMessages.length, 1);
+    assert.equal(userMessages[0].message.content, prompt);
+    assert.equal(serialized.includes('AGENTS.md instructions'), false);
+    assert.equal(serialized.includes('<INSTRUCTIONS>'), false);
+    assert.equal(serialized.includes('<environment_context>'), false);
+  });
+});
+
+test('getCodexSessionMessages collapses paired Codex assistant event and response item records', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-duplicate-assistant-event';
+    const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '05', '01');
+    const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+    const content = '现在用 Playwright 截当前页面。';
+
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: 'event_msg',
+          timestamp: '2026-05-01T08:00:00.000Z',
+          payload: {
+            type: 'agent_message',
+            phase: 'commentary',
+            message: content,
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-05-01T08:00:00.002Z',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: content }],
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].type, 'assistant');
+    assert.equal(result.messages[0].message.content, content);
+    assert.equal(result.messages[0].message.phase, 'commentary');
+  });
+});
+
+test('getCodexSessionMessages maps Codex custom apply_patch calls to FileChanges tools', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-custom-apply-patch';
+    const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '05', '02');
+    const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+    const patch = [
+      '*** Begin Patch',
+      '*** Update File: src/app.ts',
+      '@@',
+      '-old',
+      '+new',
+      '*** End Patch',
+    ].join('\n');
+
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-05-02T08:00:00.000Z',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'apply_patch',
+            call_id: 'call-custom-patch',
+            input: patch,
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          timestamp: '2026-05-02T08:00:01.000Z',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call-custom-patch',
+            output: 'Done!',
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+
+    assert.equal(result.messages.length, 2);
+    assert.equal(result.messages[0].type, 'tool_use');
+    assert.equal(result.messages[0].toolName, 'FileChanges');
+    assert.equal(result.messages[0].toolCallId, 'call-custom-patch');
+    assert.equal(result.messages[0].toolInput.changes[0].path, 'src/app.ts');
+    assert.equal(result.messages[1].type, 'tool_result');
+    assert.equal(result.messages[1].output, 'Done!');
+  });
+});
+
+  test('getCodexSessionMessages keeps a tool-only history page intact', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-tail-window-session';
+    await createCodexSessionFixture(tempHome, sessionId);
+
+    const firstPage = await getCodexSessionMessages(sessionId, 2, 0, null);
+      const olderPage = await getCodexSessionMessages(sessionId, 2, firstPage.nextRawLineOffset, null);
+
+    assert.equal(firstPage.total, 4);
+      assert.equal(firstPage.hasMore, false);
+      assert.equal(firstPage.nextRawLineOffset, 4);
+      assert.equal(firstPage.messages.length, 4);
+      assert.equal(firstPage.messages[0].toolCallId, 'call_1');
+      assert.equal(firstPage.messages[3].toolCallId, 'call_2');
+
+    assert.equal(olderPage.total, 4);
+    assert.equal(olderPage.hasMore, false);
+    assert.equal(olderPage.nextRawLineOffset, 4);
+      assert.equal(olderPage.messages.length, 0);
+  });
+});
+
+test('getCodexSessionMessages uses raw line cursor and hides internal Codex roles', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-history-raw-cursor-and-internal-roles';
+    const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '06', '07');
+    const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+    const lines = [
+      {
+        type: 'session_meta',
+        timestamp: '2026-06-07T04:00:00.000Z',
+        payload: { id: sessionId, cwd: '/tmp/agentporch-codex-history-project' },
+      },
+      {
+        type: 'response_item',
+        timestamp: '2026-06-07T04:00:00.001Z',
+        payload: {
+          type: 'message',
+          role: 'developer',
+          content: [{ type: 'input_text', text: '内部开发者指令，不应显示。' }],
+        },
+      },
+    ];
+
+    for (let turn = 1; turn <= 3; turn += 1) {
+      const userText = `第${turn}轮用户需求`;
+      lines.push(
+        {
+          type: 'response_item',
+          timestamp: `2026-06-07T04:0${turn}:00.000Z`,
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: userText }],
+          },
+        },
+        {
+          type: 'event_msg',
+          timestamp: `2026-06-07T04:0${turn}:00.001Z`,
+          payload: { type: 'user_message', message: userText },
+        },
+        {
+          type: 'response_item',
+          timestamp: `2026-06-07T04:0${turn}:10.000Z`,
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: `第${turn}轮 assistant 回复` }],
+          },
+        },
+        {
+          type: 'response_item',
+          timestamp: `2026-06-07T04:0${turn}:20.000Z`,
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            call_id: `call-${turn}`,
+            arguments: JSON.stringify({ cmd: `printf turn-${turn}` }),
+          },
+        },
+      );
+    }
+
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(sessionFile, `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`, 'utf8');
+
+    const firstPage = await getCodexSessionMessages(sessionId, 5, 0, null);
+    const secondPage = await getCodexSessionMessages(sessionId, 5, firstPage.nextRawLineOffset, null);
+    const allMessages = await getCodexSessionMessages(sessionId, null, 0, null);
+    const rawLineNumbers = (messages) => new Set(
+      messages
+        .map((message) => String(message.messageKey || '').match(/:line:(\d+):/)?.[1])
+        .filter(Boolean),
+    );
+    const firstLines = rawLineNumbers(firstPage.messages);
+    const secondLines = rawLineNumbers(secondPage.messages);
+    const overlap = [...firstLines].filter((lineNumber) => secondLines.has(lineNumber));
+    const userMessages = allMessages.messages.filter((message) => message.type === 'user');
+
+      assert.ok(firstPage.nextRawLineOffset > 5);
+    assert.deepEqual(overlap, []);
+    assert.equal(
+      allMessages.messages.some((message) => message.message?.role === 'developer'),
+      false,
+    );
+    assert.deepEqual(
+      userMessages.map((message) => message.message.content),
+      ['第1轮用户需求', '第2轮用户需求', '第3轮用户需求'],
+    );
+  });
+});
+
+test('getCodexSessionMessages maps native Codex tool item records', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-native-tool-items';
+    const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '04', '24');
+    const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const lines = [
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-24T08:00:00.000Z',
+        payload: {
+          type: 'command_execution',
+          id: 'native_cmd',
+          command: 'ctx_batch_execute',
+          arguments: { queries: ['needle'] },
+          output: 'line 1\nline 2',
+          exitCode: 0,
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-24T08:00:01.000Z',
+        payload: {
+          type: 'file_change',
+          id: 'native_edit',
+          path: 'src/native.js',
+          changeType: 'edit',
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-04-24T08:00:02.000Z',
+        payload: {
+          type: 'mcp_tool_call',
+          id: 'native_mcp',
+          server: 'context_mode',
+          name: 'ctx_batch_execute',
+          arguments: { commands: [] },
+          result: { content: 'indexed native result' },
+        },
+      }),
+    ];
+    await fs.writeFile(sessionFile, `${lines.join('\n')}\n`, 'utf8');
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+    const toolUses = result.messages.filter((message) => message.type === 'tool_use');
+    const toolResults = result.messages.filter((message) => message.type === 'tool_result');
+
+    assert.deepEqual(
+      toolUses.map((message) => [message.toolName, message.toolCallId]),
+      [
+        ['ctx_batch_execute', 'native_cmd'],
+        ['FileChanges', 'native_edit'],
+        ['context_mode:ctx_batch_execute', 'native_mcp'],
+      ],
+    );
+    assert.deepEqual(toolUses[0].toolInput, { queries: ['needle'] });
+    assert.equal(toolUses[1].toolInput.changes[0].path, 'src/native.js');
+    assert.equal(toolResults.length, 3);
+    assert.equal(toolResults[0].output, 'line 1\nline 2');
+    assert.equal(toolResults[2].output, 'indexed native result');
+  });
+});
+
+test('Codex project overview uses first request title without deep transcript summary', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    clearProjectDirectoryCache();
+    const projectPath = path.join(tempHome, 'workspace', 'codex-demo');
+    const firstRequest = '请先定位首页空白问题';
+    const followupRequest = 'Repair首页空白问题';
+    await fs.mkdir(projectPath, { recursive: true });
+    await addProjectManually(projectPath, 'Codex Demo');
+    await createCodexSummaryFixture(tempHome, 'codex-summary-session', projectPath, [firstRequest, followupRequest]);
+
+    const projects = await getProjects();
+    const project = projects.find((entry) => entry.fullPath === projectPath || entry.path === projectPath);
+
+    assert.ok(project);
+    assert.equal(project.codexSessions.length, 1);
+    assert.equal(project.codexSessions[0].summary, 'Codex Session');
+    assert.equal(project.codexSessions[0].routeTitle, firstRequest);
+    assert.equal(project.codexSessions[0].title, firstRequest);
+
+    const detail = await getCodexSessionMessages('codex-summary-session', null, 0, null);
+    assert.equal(
+      detail.messages.some((message) => message.message?.content === followupRequest),
+      true,
+    );
+  });
+});
+
+test('Codex project overview preserves the full first request for content cards', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    clearProjectDirectoryCache();
+    const projectPath = path.join(tempHome, 'workspace', 'codex-title-prefix');
+    const firstRequest = '请Repair项目主页Manual sessions卡片显示过多的问题并保持列表清爽，同时确保Title内容不会在固定五十个字符处被提前裁短，最终仅由响应式界面决定显示一行还是两行';
+    await fs.mkdir(projectPath, { recursive: true });
+    await addProjectManually(projectPath, 'Codex Title Prefix');
+    await createCodexSummaryFixture(tempHome, 'codex-title-prefix-session', projectPath, [firstRequest]);
+
+    const projects = await getProjects();
+    const project = projects.find((entry) => entry.fullPath === projectPath || entry.path === projectPath);
+
+    assert.ok(project);
+    assert.equal(project.codexSessions[0].routeTitle, Array.from(firstRequest).slice(0, 20).join(''));
+    assert.equal(project.codexSessions[0].title, firstRequest);
+  });
+});
+
+test('getCodexSessionMessages preserves assistant phase metadata from Codex transcripts', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    const sessionId = 'codex-phase-session';
+    await createCodexPhaseFixture(tempHome, sessionId);
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+    const messages = Array.isArray(result.messages) ? result.messages : [];
+
+    assert.equal(messages.length, 2);
+    assert.equal(messages[0].message?.phase, 'commentary');
+    assert.equal(messages[0].message?.content, '先继续排查路由映射。');
+    assert.equal(messages[1].message?.phase, 'final_answer');
+    assert.equal(messages[1].message?.content, '根因已经确认。');
+  });
+});
+
+test('getCodexSessionMessages attaches cumulative turn token usage and model to the final answer', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    /** Build one turn with a prior cumulative snapshot to verify delta billing. */
+    const sessionId = 'codex-turn-token-cost-session';
+    const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '07', '27');
+    const sessionFile = path.join(sessionsDir, `${sessionId}.jsonl`);
+    const tokenCount = (timestamp, usage) => ({
+      timestamp,
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: usage },
+      },
+    });
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      sessionFile,
+      [
+        {
+          timestamp: '2026-07-27T00:00:00.000Z',
+          type: 'session_meta',
+          payload: { id: sessionId, model: 'gpt-5.6-sol', cwd: tempHome },
+        },
+        tokenCount('2026-07-27T00:00:01.000Z', {
+          input_tokens: 1_000,
+          cached_input_tokens: 200,
+          cache_write_input_tokens: 0,
+          output_tokens: 50,
+          total_tokens: 1_050,
+        }),
+        {
+          timestamp: '2026-07-27T00:00:02.000Z',
+          type: 'event_msg',
+          payload: { type: 'user_message', message: '检查成本' },
+        },
+        {
+          timestamp: '2026-07-27T00:00:03.000Z',
+          type: 'turn_context',
+          payload: { model: 'gpt-5.6-sol' },
+        },
+        {
+          timestamp: '2026-07-27T00:00:10.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: '成本已计算。' }],
+          },
+        },
+        tokenCount('2026-07-27T00:00:11.000Z', {
+          input_tokens: 2_100,
+          cached_input_tokens: 700,
+          cache_write_input_tokens: 10,
+          output_tokens: 150,
+          total_tokens: 2_250,
+        }),
+      ].map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+      'utf8',
+    );
+
+    const result = await getCodexSessionMessages(sessionId, null, 0, null);
+    const assistant = result.messages.find((message) => message.type === 'assistant');
+
+    assert.equal(assistant.model, 'gpt-5.6-sol');
+    assert.deepEqual(assistant.tokenUsage, {
+      inputTokens: 1_100,
+      cachedInputTokens: 500,
+      cacheWriteInputTokens: 10,
+      outputTokens: 100,
+      totalTokens: 1_200,
+    });
+  });
+});
+
+test('getProjects keeps every visible Codex session in project overview snapshots', async () => {
+  await withTemporaryHome(async (tempHome) => {
+    clearProjectDirectoryCache();
+    const projectPath = path.join(tempHome, 'workspace', 'codex-overview-demo');
+    await fs.mkdir(projectPath, { recursive: true });
+    await addProjectManually(projectPath, 'Codex Overview Demo');
+
+    for (let index = 0; index < 6; index += 1) {
+      const sequence = String(index + 1).padStart(2, '0');
+      await createCodexSummaryFixture(
+        tempHome,
+        `codex-overview-session-${sequence}`,
+        projectPath,
+        [`Repair项目主页Session 卡片限制 ${sequence}`],
+        { baseTimestamp: `2026-04-20T08:00:${sequence}.000Z` },
+      );
+    }
+
+    clearProjectDirectoryCache();
+    const projects = await getProjects();
+    const project = projects.find((entry) => entry.fullPath === projectPath || entry.path === projectPath);
+
+    assert.ok(project);
+    assert.equal(project.codexSessions.length, 6);
+    assert.equal(project.codexSessions[0].summary, 'Codex Session');
+    assert.equal(project.codexSessions[5].summary, 'Codex Session');
+  });
+});

@@ -1,0 +1,1057 @@
+/**
+ * Define the shell WebSocket and PTY relay connection boundary.
+ * Share one runtime context for reconnects, buffers, and timeout cleanup.
+ */
+import type { WebSocket } from 'ws';
+import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import path from 'node:path';
+import { sanitizeChildProcessEnv } from '../security/child-process-env.js';
+import {
+    probeSharedCodexThread,
+} from '../domains/codex-app-server/shared-thread-probe.js';
+import { beginCodexRemoteTuiThreadCapture } from '../domains/codex-app-server/runtime-facade.js';
+import {
+    readProviderSessionBinding,
+    writeProviderSessionBinding,
+} from '../domains/provider-runtime/provider-session-binding.js';
+import { finalizeManualSessionRoute, getManualSessionRouteRuntime } from '../projects.js';
+import { resolveCodexTerminalAttachPlan } from './codex-terminal-attach-plan.js';
+import {
+    flushShellOutput,
+    markShellOutputInteractive,
+    queueShellOutput,
+    resetShellOutputQueue,
+    takeShellReplay,
+} from './shell-output-batcher.js';
+import { createTmuxTerminalRuntime } from './terminal-tmux-runtime.js';
+import { refreshTerminalClient } from './terminal-processes.js';
+import {
+    loadNodePtyRuntime,
+    TerminalUnavailableError,
+    type NodePtyRuntime,
+} from './optional-node-pty.js';
+
+type LooseRecord = Record<string, any>;
+type PendingForceHandoffOffer = {
+    token: string;
+    expiresAt: number;
+    projectName: string;
+    projectPath: string;
+    routeSessionId: string | null;
+    providerSessionId: string;
+};
+
+const FORCE_HANDOFF_OFFER_TTL_MS = 60_000;
+type TmuxCleanupState = { token: symbol; timer: NodeJS.Timeout | null };
+const tmuxCleanupTimers = new Map<string, TmuxCleanupState>();
+
+/**
+ * Normalize chat TUI providers while retaining Codex/Pi PTY boundaries.
+ */
+function normalizeShellProvider(provider: unknown): 'codex' | 'pi' | 'claude' | 'plain-shell' {
+    if (provider === 'pi') {
+        return 'pi';
+    }
+    if (provider === 'plain-shell') {
+        return 'plain-shell';
+    }
+    if (provider === 'claude') return 'claude';
+    return 'codex';
+}
+
+/**
+ * Build provider CLI startup or resume commands.
+ */
+function buildProviderShellCommand(input: {
+    os: any;
+    provider: 'codex' | 'pi' | 'claude';
+    projectPath: string;
+    hasSession: boolean;
+    resumeSessionId?: string | null;
+    newSessionId?: string | null;
+    codexCommandArgs?: string[] | null;
+}): string {
+    const { os, provider, projectPath, hasSession, resumeSessionId, newSessionId, codexCommandArgs } = input;
+    const cliName = provider === 'pi' ? 'pi' : provider === 'claude' ? 'claude' : 'codex';
+    const plannedCodexCommand = provider === 'codex' && codexCommandArgs
+        ? `codex${codexCommandArgs.length ? ` ${codexCommandArgs.map(quotePosixShell).join(' ')}` : ''}`
+        : '';
+    const claudePermissionFlag = provider === 'claude' ? ' --dangerously-skip-permissions' : '';
+    const resumeCommand = plannedCodexCommand || (provider === 'pi'
+        ? `${cliName} --session ${quotePosixShell(String(resumeSessionId || ''))}`
+        : provider === 'claude'
+            ? `${cliName}${claudePermissionFlag} --resume ${quotePosixShell(String(resumeSessionId || ''))}`
+            : `${cliName} resume ${quotePosixShell(String(resumeSessionId || ''))}`);
+    if (os.platform() === 'win32') {
+        const createCommand = newSessionId && provider !== 'codex'
+            ? `${cliName} --session-id ${newSessionId}`
+            : cliName;
+        const providerCommand = plannedCodexCommand || (hasSession && resumeSessionId ? resumeCommand : createCommand);
+        return `Set-Location -Path "${projectPath}"; ${providerCommand}; powershell.exe -NoExit`;
+    }
+
+    const createCommand = newSessionId && provider !== 'codex'
+        ? `${cliName}${claudePermissionFlag} --session-id ${quotePosixShell(newSessionId)}`
+        : `${cliName}${claudePermissionFlag}`;
+    const providerCommand = plannedCodexCommand || (hasSession && resumeSessionId ? resumeCommand : createCommand);
+    const claudeEnvironmentSetup = provider === 'claude' ? buildClaudeEnvironmentSetup() : '';
+    const interactiveCommand = [
+        buildPortableUserBinPathExport(),
+        claudeEnvironmentSetup,
+        `{ ${providerCommand}; }`,
+        `exec "\${SHELL:-/bin/bash}" -l`,
+    ].filter(Boolean).join('; ');
+    return `cd ${quotePosixShell(projectPath)} && exec "\${SHELL:-/bin/bash}" -lic ${quotePosixShell(interactiveCommand)}`;
+}
+
+/**
+ * Quote POSIX shell arguments safely for tmux paths and startup commands.
+ */
+function quotePosixShell(value: string): string {
+    return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Load the optional Claude provider environment before starting or resuming
+ * Claude Code. zsh-abbr entries are editor expansions rather than executable
+ * shell commands, so callers configure the file that the abbreviation sources.
+ */
+function buildClaudeEnvironmentSetup(): string {
+    const environmentFile = String(process.env.AGENTPORCH_CLAUDE_ENV_FILE || '').trim();
+    if (!environmentFile) {
+        return '';
+    }
+    const quotedEnvironmentFile = quotePosixShell(environmentFile);
+    return `[ -f ${quotedEnvironmentFile} ] || { echo "AgentPorch Claude environment file does not exist: ${quotedEnvironmentFile}" >&2; exit 1; }; . ${quotedEnvironmentFile}`;
+}
+
+/**
+ * Add common cross-platform CLI-manager user binary directories as a shell-config fallback.
+ */
+function buildPortableUserBinPathExport(): string {
+    return [
+        'export PATH="',
+        '$HOME/.local/bin:',
+        '$HOME/bin:',
+        '${PNPM_HOME:+$PNPM_HOME:}',
+        '${PNPM_HOME:+$PNPM_HOME/bin:}',
+        '$HOME/.local/share/pnpm:',
+        '$HOME/.local/share/pnpm/bin:',
+        '$HOME/.bun/bin:',
+        '$HOME/.cargo/bin:',
+        '$PATH"',
+    ].join('');
+}
+
+/** Run a bounded, read-only external CLI capability probe. */
+function runExternalProviderProbe(command: string): Promise<boolean> {
+    const probe = `${buildPortableUserBinPathExport()}; ${command}`;
+    return new Promise((resolve) => {
+        execFile(process.env.SHELL || '/bin/sh', ['-lc', probe], { timeout: 2_000 }, (error) => resolve(!error));
+    });
+}
+
+/**
+ * Inspect provider installation, version, and authentication capabilities.
+ * AgentPorch reports failures without installing, signing in, upgrading, or hosting providers.
+ */
+async function diagnoseExternalProvider(provider: 'pi' | 'claude'): Promise<string[]> {
+    const cliName = provider === 'pi' ? 'pi' : 'claude';
+    const environmentSetup = provider === 'claude' ? buildClaudeEnvironmentSetup() : '';
+    const runProviderProbe = (command: string) => runExternalProviderProbe(
+        [environmentSetup, command].filter(Boolean).join('; '),
+    );
+    const [cliAvailable, versionReadable, authenticationReady] = await Promise.all([
+        runProviderProbe(`command -v ${cliName} >/dev/null 2>&1`),
+        runProviderProbe(`${cliName} --version >/dev/null 2>&1`),
+        provider === 'claude'
+            ? runProviderProbe('claude auth status >/dev/null 2>&1')
+            : Promise.resolve(false),
+    ]);
+    const failures: string[] = [];
+    if (!cliAvailable) failures.push('cli-unavailable');
+    if (cliAvailable && !versionReadable) failures.push('version-unavailable');
+    if (cliAvailable && !authenticationReady) failures.push('authentication-unverified');
+    return failures;
+}
+
+/**
+ * Build environment variables for managed terminals.
+ * The Codex environment may inject NO_COLOR, which tmux captures at first creation;
+ * remove it before spawning the PTY while retaining color-terminal capabilities.
+ */
+export function buildManagedTerminalEnvironment(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+    const environment = sanitizeChildProcessEnv(baseEnv);
+    delete environment.NO_COLOR;
+
+    return {
+        ...environment,
+        TERM: 'xterm-256color',
+        COLORTERM: 'truecolor',
+        FORCE_COLOR: '3',
+    };
+}
+
+/**
+ * Build startup commands for managed tmux terminals.
+ * A project directory may have been deleted; first remove stale sessions with invalid working directories,
+ * then create the new session to avoid shell getcwd() failures.
+ */
+function buildManagedTmuxShellCommand(
+    tmuxRuntime: ReturnType<typeof createTmuxTerminalRuntime>,
+    activeTarget: string,
+    projectPath: string,
+    shellCommand: string,
+): string {
+    const quotedActiveTarget = quotePosixShell(activeTarget);
+    const quotedTarget = quotePosixShell(tmuxRuntime.target);
+    const quotedSessionName = quotePosixShell(tmuxRuntime.sessionName);
+    const quotedWindowName = quotePosixShell(tmuxRuntime.windowName);
+    const quotedProjectPath = quotePosixShell(projectPath);
+    const quotedShellCommand = quotePosixShell(shellCommand);
+    const invalidTargetCleanup = activeTarget === tmuxRuntime.target
+        ? `tmux kill-window -t ${quotedActiveTarget} 2>/dev/null || true`
+        : `tmux kill-session -t ${quotedActiveTarget} 2>/dev/null || true`;
+
+    return [
+        `if [ ! -d ${quotedProjectPath} ]; then echo "AgentPorch project directory does not exist: ${quotedProjectPath}" >&2; exit 1; fi`,
+        `if tmux has-session -t ${quotedActiveTarget} 2>/dev/null; then tmux list-panes -t ${quotedActiveTarget} -F '#{pane_current_path}' 2>/dev/null | while IFS= read -r pane_path; do if [ -z "$pane_path" ] || [ ! -d "$pane_path" ]; then ${invalidTargetCleanup}; break; fi; done; fi`,
+        `if tmux has-session -t ${quotedActiveTarget} 2>/dev/null; then tmux attach-session -t ${quotedActiveTarget}; else if tmux has-session -t ${quotedSessionName} 2>/dev/null; then tmux new-window -d -t ${quotedSessionName} -n ${quotedWindowName} ${quotedShellCommand}; else tmux new-session -d -s ${quotedSessionName} -n ${quotedWindowName} -e HOME="$HOME" -e USERPROFILE="\${USERPROFILE:-$HOME}" -e PATH="$PATH" -e SHELL="\${SHELL:-/bin/bash}" ${quotedShellCommand}; fi; tmux set-option -p -t ${quotedTarget} @agentporch_binding ${quotedWindowName}; tmux attach-session -t ${quotedTarget}; fi`,
+    ].join('; ');
+}
+
+/**
+ * Execute tmux lifecycle commands and log idempotent outcomes such as absent sessions.
+ */
+function executeTmuxLifecycleCommand(args: string[], actionLabel: string): void {
+    execFile('tmux', args, (error, stdout, stderr) => {
+        if (error) {
+            const output = String(stderr || stdout || error.message || '').trim();
+            console.warn(`tmux ${actionLabel} command finished with warning:`, output);
+            return;
+        }
+
+        console.log(`tmux ${actionLabel} command completed`);
+    });
+}
+
+/**
+ * Cancel pending window cleanup and preserve state when reconnecting within five minutes.
+ */
+function cancelTmuxCleanup(targets: string[]): void {
+    for (const target of targets) {
+        const state = tmuxCleanupTimers.get(target);
+        if (state) {
+            if (state.timer) clearTimeout(state.timer);
+            tmuxCleanupTimers.delete(target);
+        }
+    }
+}
+
+/** Read one pane only for idle cleanup diagnostics, never for browser restoration. */
+function captureTmuxPane(target: string): Promise<string> {
+    return new Promise((resolve) => {
+        execFile('tmux', ['capture-pane', '-p', '-e', '-t', target], { timeout: 2_000 },
+            (error, stdout) => resolve(error ? '' : String(stdout || '')));
+    });
+}
+
+/**
+ * Inspect window activity and visible output before collecting active background tasks.
+ */
+async function readTmuxActivityMarker(target: string): Promise<string> {
+    const activity = await new Promise<string>((resolve) => {
+        execFile(
+            'tmux',
+            ['display-message', '-p', '-t', target, '#{window_activity}:#{pane_dead}:#{pane_current_command}'],
+            (error, stdout) => resolve(error ? '' : String(stdout || '').trim()),
+        );
+    });
+    const snapshot = await captureTmuxPane(target);
+    return `${activity}\n${snapshot}`;
+}
+
+/**
+ * Delay window cleanup after disconnect; close entire legacy standalone sessions.
+ */
+function scheduleTmuxCleanup(
+    tmuxRuntime: ReturnType<typeof createTmuxTerminalRuntime>,
+    activeTarget: string,
+    delayMs: number,
+): void {
+    cancelTmuxCleanup([activeTarget]);
+    const state: TmuxCleanupState = { token: Symbol(activeTarget), timer: null };
+    tmuxCleanupTimers.set(activeTarget, state);
+    void readTmuxActivityMarker(activeTarget).then((initialMarker) => {
+        if (tmuxCleanupTimers.get(activeTarget)?.token !== state.token) return;
+        const timer = setTimeout(() => {
+            void readTmuxActivityMarker(activeTarget).then((latestMarker) => {
+                if (tmuxCleanupTimers.get(activeTarget)?.token !== state.token) return;
+                if (latestMarker && latestMarker !== initialMarker) {
+                    scheduleTmuxCleanup(tmuxRuntime, activeTarget, delayMs);
+                    return;
+                }
+                tmuxCleanupTimers.delete(activeTarget);
+                const cleanupArgs = tmuxRuntime.terminateTerminal(activeTarget);
+                executeTmuxLifecycleCommand(cleanupArgs.slice(1), cleanupArgs[1]);
+            });
+        }, delayMs);
+        timer.unref?.();
+        state.timer = timer;
+    });
+}
+
+/**
+ * Check whether a tmux session exists for legacy-key reconnect compatibility.
+ */
+function tmuxSessionExists(sessionName: string): Promise<boolean> {
+    return new Promise((resolve) => {
+        // tmux accepts prefixes by default; a legacy c9 name can match a c9... hash.
+        const exactTarget = sessionName.split(':').map((part) => `=${part}`).join(':');
+        execFile('tmux', ['has-session', '-t', exactTarget], (error) => {
+            resolve(!error);
+        });
+    });
+}
+
+/**
+ * Find an existing tmux name, supporting short and legacy base64 names.
+ */
+async function findExistingTmuxSessionName(tmuxRuntime: ReturnType<typeof createTmuxTerminalRuntime>): Promise<string> {
+    for (const sessionName of [tmuxRuntime.target, ...tmuxRuntime.legacySessionNames]) {
+        if (await tmuxSessionExists(sessionName)) {
+            return sessionName;
+        }
+    }
+    return '';
+}
+
+/**
+ * Resolve shell-init identity for resume and PTY isolation.
+ */
+function resolveShellSessionIdentity(data: LooseRecord): {
+    routeSessionId: string | null;
+    providerSessionId: string | null;
+    resumeSessionId: string | null;
+    ptyIdentity: string;
+    legacyPtyIdentities: string[];
+} {
+    const routeSessionId = typeof data.routeSessionId === 'string' && data.routeSessionId.trim()
+        ? data.routeSessionId.trim()
+        : null;
+    const providerSessionId = typeof data.providerSessionId === 'string' && data.providerSessionId.trim()
+        ? data.providerSessionId.trim()
+        : typeof data.sessionId === 'string' && data.sessionId.trim() && !/^c\d+$/.test(data.sessionId.trim())
+            ? data.sessionId.trim()
+            : null;
+    const resumeSessionId = providerSessionId;
+    const ptyIdentity = routeSessionId
+        ? `route:${routeSessionId}`
+        : providerSessionId
+            ? `provider:${providerSessionId}`
+            : 'new-session';
+    const legacyPtyIdentities = routeSessionId
+        ? [
+            `${routeSessionId}_no-provider-session`,
+            providerSessionId ? `${routeSessionId}_${providerSessionId}` : '',
+        ].filter(Boolean)
+        : [];
+
+    return { routeSessionId, providerSessionId, resumeSessionId, ptyIdentity, legacyPtyIdentities };
+}
+
+/**
+ * Close and clear cached PTY sessions.
+ */
+export function closeShellPtySessions(runtime: any): void {
+    for (const state of tmuxCleanupTimers.values()) {
+        if (state.timer) clearTimeout(state.timer);
+    }
+    tmuxCleanupTimers.clear();
+    for (const [, session] of runtime.ptySessionsMap.entries()) {
+        if (session.timeoutId) {
+            clearTimeout(session.timeoutId);
+        }
+        resetShellOutputQueue(session);
+        if (session.pty && session.pty.kill) {
+            session.pty.kill();
+        }
+    }
+    runtime.ptySessionsMap.clear();
+}
+
+/**
+ * Handle shell connections, PTY spawning, buffering, resize, and disconnect retention.
+ */
+export function handleShellConnection(deps: any, ws: WebSocket): void {
+    const { ptySessionsMap, PTY_SESSION_TIMEOUT, SHELL_URL_PARSE_BUFFER_LIMIT, stripAnsiSequences, normalizeDetectedUrl, extractUrlsFromText, shouldAutoOpenUrlFromOutput, os, WebSocket } = deps;
+    const loadPty: () => Promise<NodePtyRuntime> = deps.loadNodePtyRuntime ?? loadNodePtyRuntime;
+    // Handle shell WebSocket connections
+    function runShellConnection(ws: WebSocket) {
+        console.log('🐚 Shell client connected');
+        let shellProcess: any = null;
+        let ptySessionKey: string | null = null;
+        let pendingForceHandoffOffer: PendingForceHandoffOffer | null = null;
+        let urlDetectionBuffer = '';
+        const announcedAuthUrls = new Set();
+
+        ws.on('message', async (message: Buffer | string) => {
+            try {
+                const data: LooseRecord = JSON.parse(String(message));
+                console.log('📨 Shell message received:', data.type);
+
+                if (data.type === 'init') {
+                    let ptyRuntime: NodePtyRuntime;
+                    try {
+                        ptyRuntime = await loadPty();
+                    } catch (error) {
+                        const terminalError = error instanceof TerminalUnavailableError
+                            ? error
+                            : new TerminalUnavailableError(error);
+                        console.warn('[Shell] Optional terminal runtime is unavailable:', terminalError.message);
+                        ws.send(JSON.stringify({
+                            type: 'terminal-unavailable',
+                            reason: 'node-pty-unavailable',
+                            message: terminalError.message,
+                        }));
+                        ws.send(JSON.stringify({
+                            type: 'output',
+                            data: `\x1b[31m${terminalError.message}\x1b[0m\r\n`,
+                        }));
+                        return;
+                    }
+                    const projectPath = data.projectPath || process.cwd();
+                    const identity = resolveShellSessionIdentity(data);
+                    let routeSessionId = identity.routeSessionId;
+                    let providerSessionId = identity.providerSessionId;
+                    let resumeSessionId = identity.resumeSessionId;
+                    const provider = normalizeShellProvider(data.provider);
+                    const projectName = typeof data.projectName === 'string' ? data.projectName : '';
+                    // Overview cards may contain only a provider ID; restore the existing project page number first,
+                    // so both entries reconnect to the same terminal even after a service restart.
+                    if (!routeSessionId && providerSessionId && provider !== 'plain-shell') {
+                        const route = await getManualSessionRouteRuntime(projectName, projectPath, providerSessionId);
+                        const routeIndex = Number(route?.routeIndex);
+                        if (route?.provider === provider
+                            && (route.providerSessionId === providerSessionId || route.sessionId === providerSessionId)
+                            && Number.isInteger(routeIndex) && routeIndex > 0) {
+                            routeSessionId = `c${routeIndex}`;
+                        }
+                    }
+                    if (routeSessionId && provider !== 'plain-shell') {
+                        const persistedBinding = await readProviderSessionBinding(projectName, projectPath, routeSessionId);
+                        if (persistedBinding?.provider === provider) {
+                            providerSessionId = persistedBinding.providerSessionId;
+                            resumeSessionId = persistedBinding.providerSessionId;
+                        }
+                    }
+                    const { ptyIdentity, legacyPtyIdentities } = resolveShellSessionIdentity({
+                        ...data, routeSessionId, providerSessionId,
+                    });
+                    // Also support terminals opened by provider ID before a page number was assigned.
+                    if (routeSessionId && providerSessionId && provider !== 'plain-shell') {
+                        legacyPtyIdentities.push(`provider:${providerSessionId}`);
+                    }
+                    const forceHandoffRequested = data.forceHandoff === true;
+                    const forceHandoffToken = typeof data.handoffToken === 'string' ? data.handoffToken : '';
+                    const forceHandoffAuthorized = Boolean(
+                        forceHandoffRequested
+                        && pendingForceHandoffOffer
+                        && pendingForceHandoffOffer.expiresAt >= Date.now()
+                        && pendingForceHandoffOffer.token === forceHandoffToken
+                        && pendingForceHandoffOffer.projectName === projectName
+                        && pendingForceHandoffOffer.projectPath === projectPath
+                        && pendingForceHandoffOffer.routeSessionId === routeSessionId
+                        && pendingForceHandoffOffer.providerSessionId === providerSessionId,
+                    );
+                    if (forceHandoffRequested && !forceHandoffAuthorized) {
+                        ws.send(JSON.stringify({
+                            type: 'handoff-force-rejected',
+                            reason: 'handoff-confirmation-invalid-or-expired',
+                        }));
+                        return;
+                    }
+                    if (forceHandoffAuthorized) {
+                        pendingForceHandoffOffer = null;
+                    }
+                    let hasSession = Boolean(data.hasSession && resumeSessionId) || Boolean(providerSessionId);
+                    const initialCommand = data.initialCommand;
+                    const isPlainShell = data.isPlainShell || (!!initialCommand && !hasSession) || provider === 'plain-shell';
+                    const riskConfirmed = data.riskConfirmed === true;
+                    urlDetectionBuffer = '';
+                    announcedAuthUrls.clear();
+
+                    if (!isPlainShell && hasSession && (provider === 'claude' || provider === 'pi') && !riskConfirmed) {
+                        const failures = await diagnoseExternalProvider(provider);
+                        if (data.externalSessionState !== 'idle') {
+                            failures.push(`session-${data.externalSessionState || 'unknown'}`);
+                        }
+                        if (failures.length > 0) {
+                            ws.send(JSON.stringify({
+                                type: 'provider-risk-confirmation-required',
+                                provider,
+                                reason: failures[0],
+                                failures,
+                            }));
+                            return;
+                        }
+                    }
+
+                    // Login commands should never reuse cached sessions.
+                    const isLoginCommand = initialCommand && (
+                        initialCommand.includes('setup-token') ||
+                        initialCommand.includes('auth login')
+                    );
+
+                    // Include command hash in session key so different commands get separate sessions
+                    const commandSuffix = isPlainShell && initialCommand
+                        ? `_cmd_${Buffer.from(initialCommand).toString('base64').slice(0, 16)}`
+                        : '';
+                    const primaryPtySessionKey = `${projectPath}_${provider}_${ptyIdentity}${commandSuffix}`;
+                    const legacyPtySessionKeys = legacyPtyIdentities.map((identity) => `${projectPath}_${provider}_${identity}${commandSuffix}`);
+                    const candidatePtySessionKeys = [primaryPtySessionKey, ...legacyPtySessionKeys];
+                    ptySessionKey = primaryPtySessionKey;
+                    let tmuxRuntime = createTmuxTerminalRuntime(ptySessionKey);
+                    let activeTmuxSessionName = tmuxRuntime.target;
+                    let managedTmuxExists = false;
+
+                    // Kill any existing login session before starting fresh
+                    if (isLoginCommand) {
+                        const oldSession = ptySessionsMap.get(ptySessionKey);
+                        if (oldSession) {
+                            console.log('🧹 Cleaning up existing login session:', ptySessionKey);
+                            if (oldSession.timeoutId) clearTimeout(oldSession.timeoutId);
+                            resetShellOutputQueue(oldSession);
+                            if (oldSession.pty && oldSession.pty.kill) oldSession.pty.kill();
+                            ptySessionsMap.delete(ptySessionKey);
+                        }
+                    }
+
+                    const existingSessionKey = isLoginCommand || isPlainShell
+                        ? ''
+                        : candidatePtySessionKeys.find((sessionKey) => ptySessionsMap.has(sessionKey)) || '';
+                    if (existingSessionKey) {
+                        ptySessionKey = existingSessionKey;
+                        tmuxRuntime = createTmuxTerminalRuntime(ptySessionKey);
+                        activeTmuxSessionName = ptySessionsMap.get(existingSessionKey)?.tmuxTarget || tmuxRuntime.target;
+                    } else if (!isLoginCommand && !isPlainShell && os.platform() !== 'win32') {
+                        const existingTmuxSessionName = await findExistingTmuxSessionName(tmuxRuntime);
+                        if (existingTmuxSessionName) {
+                            activeTmuxSessionName = existingTmuxSessionName;
+                            managedTmuxExists = true;
+                        } else {
+                            for (const legacyPtySessionKey of legacyPtySessionKeys) {
+                                const legacyTmuxRuntime = createTmuxTerminalRuntime(legacyPtySessionKey);
+                                const legacyTmuxSessionName = await findExistingTmuxSessionName(legacyTmuxRuntime);
+                                if (!legacyTmuxSessionName) {
+                                    continue;
+                                }
+                                ptySessionKey = legacyPtySessionKey;
+                                tmuxRuntime = legacyTmuxRuntime;
+                                activeTmuxSessionName = legacyTmuxSessionName;
+                                managedTmuxExists = true;
+                                break;
+                            }
+                        }
+                    }
+                    cancelTmuxCleanup([
+                        tmuxRuntime.target,
+                        activeTmuxSessionName,
+                        ...tmuxRuntime.legacySessionNames,
+                    ]);
+
+                    const existingSession = isLoginCommand || isPlainShell ? null : ptySessionsMap.get(ptySessionKey);
+                    if (existingSession) {
+                        console.log('♻️  Reconnecting to existing PTY session:', ptySessionKey);
+                        shellProcess = existingSession.pty;
+
+                        clearTimeout(existingSession.timeoutId);
+                        existingSession.timeoutId = null;
+                        const fallbackReplay = takeShellReplay(existingSession);
+                        resetShellOutputQueue(existingSession);
+                        if (ws.readyState !== WebSocket.OPEN) return;
+                        existingSession.ws = ws;
+                        ws.send(JSON.stringify({ type: 'terminal-attached', ptyPid: shellProcess.pid }));
+                        if (existingSession.tmuxSessionName) {
+                            // Redraw the attached client's entire window, never a single pane snapshot.
+                            ws.send(JSON.stringify({ type: 'output', data: '\x1b[2J\x1b[H' }));
+                            if (Number.isInteger(data.cols) && data.cols > 0 && Number.isInteger(data.rows) && data.rows > 0) {
+                                shellProcess.resize(data.cols, data.rows);
+                            }
+                            if (!await refreshTerminalClient(shellProcess.pid)) {
+                                throw new Error('Unable to refresh the attached tmux client');
+                            }
+                        } else if (fallbackReplay) {
+                            ws.send(JSON.stringify({ type: 'output', data: fallbackReplay }));
+                        }
+                        flushShellOutput(existingSession, WebSocket);
+
+                        return;
+                    }
+
+                    console.log('[INFO] Starting shell in:', projectPath);
+                    console.log('📋 Session info:', hasSession ? `Resume session ${resumeSessionId}` : (isPlainShell ? 'Plain shell mode' : 'New session'));
+                    if (routeSessionId || providerSessionId) {
+                        console.log('🧭 Session identity:', { routeSessionId, providerSessionId });
+                    }
+                    console.log('🤖 Provider:', isPlainShell ? 'plain-shell' : provider);
+                    if (initialCommand) {
+                        console.log('⚡ Initial command:', initialCommand);
+                    }
+
+                    // First send a welcome message
+                    let welcomeMsg;
+                    if (isPlainShell) {
+                        welcomeMsg = `\x1b[36mStarting terminal in: ${projectPath}\x1b[0m\r\n`;
+                    } else {
+                        const providerName = provider === 'pi' ? 'Pi' : provider === 'claude' ? 'Claude Code' : 'Codex';
+                        welcomeMsg = hasSession ?
+                            `\x1b[36mResuming ${providerName} session ${resumeSessionId} in: ${projectPath}\x1b[0m\r\n` :
+                            `\x1b[36mStarting new ${providerName} session in: ${projectPath}\x1b[0m\r\n`;
+                    }
+
+                    ws.send(JSON.stringify({
+                        type: 'output',
+                        data: welcomeMsg
+                    }));
+
+                    try {
+                        // Prepare the shell command adapted to the platform and provider
+                        let shellCommand;
+                        let codexCommandArgs: string[] | null = null;
+                        if (!isPlainShell && provider === 'codex') {
+                            const codexHome = process.env.CODEX_HOME || path.join(homedir(), '.codex');
+                            const socketPath = path.join(codexHome, 'app-server-control', 'app-server-control.sock');
+
+                            /** Start a shared remote terminal and bind its new thread ID to the current card. */
+                            const startCapturedSharedTui = async (originalProviderSessionId: string | null): Promise<string[]> => {
+                                const capture = await beginCodexRemoteTuiThreadCapture({ projectPath });
+                                void capture.threadStarted.then(async ({ providerSessionId: capturedSessionId }) => {
+                                    if (routeSessionId) {
+                                        await writeProviderSessionBinding({
+                                            projectName,
+                                            projectPath,
+                                            routeSessionId,
+                                            provider: 'codex',
+                                            providerSessionId: capturedSessionId,
+                                        });
+                                        await finalizeManualSessionRoute(
+                                            projectName,
+                                            routeSessionId,
+                                            capturedSessionId,
+                                            'codex',
+                                            projectPath,
+                                        );
+                                    }
+                                    if (originalProviderSessionId && ws.readyState === WebSocket.OPEN) {
+                                        ws.send(JSON.stringify({
+                                            type: 'handoff-force-completed',
+                                            routeSessionId,
+                                            providerSessionId: capturedSessionId,
+                                            originalProviderSessionId,
+                                        }));
+                                    }
+                                }).catch((error) => {
+                                    const message = error instanceof Error ? error.message : String(error);
+                                    console.warn('[Shell] Failed to bind new Codex remote TUI thread:', message);
+                                    if (originalProviderSessionId && ws.readyState === WebSocket.OPEN) {
+                                        ws.send(JSON.stringify({ type: 'handoff-force-rejected', reason: message }));
+                                    }
+                                });
+                                return ['--remote', capture.endpoint, '-C', projectPath];
+                            };
+
+                            if (!providerSessionId && routeSessionId && !managedTmuxExists) {
+                                codexCommandArgs = await startCapturedSharedTui(null);
+                            }
+                            const sharedRuntimeProbe = providerSessionId
+                                ? await probeSharedCodexThread(socketPath, providerSessionId)
+                                : {
+                                    ready: false,
+                                    threadOwned: false,
+                                    threadReadable: false,
+                                    threadState: 'unknown' as const,
+                                    activeTurnDetected: false,
+                                    activeTurnOwned: false,
+                                };
+                            const attachPlan = codexCommandArgs ? null : resolveCodexTerminalAttachPlan({
+                                providerSessionId,
+                                managedTmuxExists,
+                                forceHandoff: forceHandoffAuthorized,
+                                sharedRuntime: {
+                                    ...sharedRuntimeProbe,
+                                    endpoint: `unix://${socketPath}`,
+                                },
+                                externalSessionState: data.externalSessionState === 'running' || data.isProcessing === true
+                                    ? 'running'
+                                    : data.externalSessionState === 'idle' || data.isProcessing === false
+                                        ? 'idle'
+                                        : 'unknown',
+                            });
+                            if (attachPlan?.action === 'blocked') {
+                                const canForceHandoff = Boolean(
+                                    sharedRuntimeProbe.ready
+                                    && providerSessionId,
+                                );
+                                const blockedMessage = attachPlan.reason === 'external-active-session-not-shared'
+                                    ? 'Warning: this legacy session is still active in its original runtime. Wait for it to finish or confirm a forced takeover.'
+                                    : 'Warning: the legacy session activity could not be verified. Check the original terminal or confirm a forced takeover.';
+                                if (canForceHandoff && providerSessionId) {
+                                    pendingForceHandoffOffer = {
+                                        token: randomUUID(),
+                                        expiresAt: Date.now() + FORCE_HANDOFF_OFFER_TTL_MS,
+                                        projectName,
+                                        projectPath,
+                                        routeSessionId,
+                                        providerSessionId,
+                                    };
+                                    ws.send(JSON.stringify({
+                                        type: 'handoff-warning',
+                                        reason: attachPlan.reason,
+                                        canForceHandoff: true,
+                                        handoffToken: pendingForceHandoffOffer.token,
+                                        routeSessionId,
+                                        providerSessionId,
+                                    }));
+                                } else {
+                                    pendingForceHandoffOffer = null;
+                                    ws.send(JSON.stringify({
+                                        type: 'handoff-blocked',
+                                        reason: attachPlan.reason,
+                                        sessionFailed: attachPlan.sessionFailed,
+                                    }));
+                                }
+                                ws.send(JSON.stringify({
+                                    type: 'output',
+                                    data: `\x1b[33m${blockedMessage}\x1b[0m\r\n`,
+                                }));
+                                return;
+                            }
+                            if (forceHandoffAuthorized && attachPlan) {
+                                if (!providerSessionId) {
+                                    throw new Error('Force handoff requires the original Codex session ID');
+                                }
+                                const originalProviderSessionId = providerSessionId;
+                                if (attachPlan.action === 'new-shared-tui') {
+                                    codexCommandArgs = await startCapturedSharedTui(originalProviderSessionId);
+                                    providerSessionId = null;
+                                    resumeSessionId = null;
+                                    hasSession = false;
+                                }
+                                ws.send(JSON.stringify({
+                                    type: 'handoff-force-started',
+                                    routeSessionId,
+                                    providerSessionId,
+                                    originalProviderSessionId,
+                                    action: attachPlan.action,
+                                }));
+                            }
+                            codexCommandArgs = codexCommandArgs || attachPlan?.commandArgs || null;
+                        }
+                        let newProviderSessionId: string | null = null;
+                        if (
+                            !isPlainShell
+                            && (provider === 'pi' || provider === 'claude')
+                            && routeSessionId
+                            && !providerSessionId
+                            && !managedTmuxExists
+                        ) {
+                            /**
+                             * Allocate the provider id before the TUI starts so the cN
+                             * route can render JSONL immediately after the first turn.
+                             */
+                            newProviderSessionId = randomUUID();
+                            await writeProviderSessionBinding({
+                                projectName,
+                                projectPath,
+                                routeSessionId,
+                                provider,
+                                providerSessionId: newProviderSessionId,
+                            });
+                            const finalized = await finalizeManualSessionRoute(
+                                projectName,
+                                routeSessionId,
+                                newProviderSessionId,
+                                provider,
+                                projectPath,
+                            );
+                            if (!finalized) {
+                                throw new Error(`Could not bind ${provider} session ${routeSessionId}`);
+                            }
+                            providerSessionId = newProviderSessionId;
+                            resumeSessionId = newProviderSessionId;
+                        }
+                        if (isPlainShell) {
+                            // Plain shell mode - open an interactive shell by default, or run the provided command.
+                            if (os.platform() === 'win32') {
+                                shellCommand = initialCommand
+                                    ? `Set-Location -Path "${projectPath}"; ${initialCommand}`
+                                    : `Set-Location -Path "${projectPath}"; powershell.exe -NoExit`;
+                            } else {
+                                shellCommand = initialCommand
+                                    ? `cd "${projectPath}" && ${initialCommand}`
+                                    : `cd "${projectPath}" && exec "${process.env.SHELL || '/bin/bash'}" -l`;
+                            }
+                        } else if (provider === 'codex' || provider === 'pi' || provider === 'claude') {
+                            shellCommand = buildProviderShellCommand({
+                                os,
+                                provider,
+                                projectPath,
+                                hasSession,
+                                resumeSessionId,
+                                newSessionId: newProviderSessionId,
+                                codexCommandArgs,
+                            });
+                        } else {
+                            throw new Error(`Unsupported shell provider: ${provider}`);
+                        }
+
+                        if (os.platform() !== 'win32') {
+                            const sessionName = activeTmuxSessionName;
+                            const managedTmuxCommand = buildManagedTmuxShellCommand(
+                                tmuxRuntime,
+                                sessionName,
+                                projectPath,
+                                shellCommand,
+                            );
+                            shellCommand = [
+                                'command -v tmux >/dev/null 2>&1 || { echo "Error: tmux is required for persistent terminals. Please install tmux."; exit 127; }',
+                                managedTmuxCommand,
+                            ].join(' && ');
+                        }
+
+                        console.log('🔧 Executing shell command:', shellCommand);
+                        console.log('🧩 tmux session runtime:', {
+                            sessionName: tmuxRuntime.sessionName,
+                            activeSessionName: activeTmuxSessionName,
+                            legacySessionNames: tmuxRuntime.legacySessionNames,
+                            hasSession: tmuxRuntime.hasSession().join(' '),
+                            newSession: tmuxRuntime.createSession(shellCommand).join(' '),
+                            attachSession: tmuxRuntime.attachSession().join(' '),
+                            capturePane: tmuxRuntime.capturePane().join(' '),
+                            sendKeys: tmuxRuntime.sendKeys('<input>').join(' '),
+                        });
+
+                        // Use appropriate shell based on platform
+                        const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
+                        const shellArgs = os.platform() === 'win32' ? ['-Command', shellCommand] : ['-c', shellCommand];
+
+                        // Use terminal dimensions from client if provided, otherwise use defaults
+                        const termCols = data.cols || 80;
+                        const termRows = data.rows || 24;
+                        console.log('📐 Using terminal dimensions:', termCols, 'x', termRows);
+
+                        shellProcess = ptyRuntime.spawn(shell, shellArgs, {
+                            name: 'xterm-256color',
+                            cols: termCols,
+                            rows: termRows,
+                            cwd: os.homedir(),
+                            env: buildManagedTerminalEnvironment(),
+                        });
+
+                        console.log('🟢 Shell process started with PTY, PID:', shellProcess.pid);
+
+                        ptySessionsMap.set(ptySessionKey, {
+                            pty: shellProcess,
+                            ws: ws,
+                            buffer: [],
+                            timeoutId: null,
+                            projectPath,
+                            sessionId: resumeSessionId,
+                            routeSessionId,
+                            providerSessionId,
+                            tmuxSessionName: activeTmuxSessionName,
+                            tmuxTarget: activeTmuxSessionName,
+                            isPlainShell,
+                            provider,
+                            pendingOutput: '',
+                            outputFlushTimer: null,
+                            interactiveOutputPending: false,
+                        });
+                        ws.send(JSON.stringify({ type: 'terminal-attached', ptyPid: shellProcess.pid }));
+                        const spawnedShellProcess = shellProcess;
+
+                        // Handle data output
+                        spawnedShellProcess.onData((data: string) => {
+                            const session = ptySessionsMap.get(ptySessionKey);
+                            if (!session || session.pty !== spawnedShellProcess) return;
+
+                            let outputData = data;
+                            const cleanChunk = stripAnsiSequences(data);
+                            urlDetectionBuffer = `${urlDetectionBuffer}${cleanChunk}`.slice(-SHELL_URL_PARSE_BUFFER_LIMIT);
+
+                            outputData = outputData.replace(
+                                /OPEN_URL:\s*(https?:\/\/[^\s\x1b\x07]+)/g,
+                                '[INFO] Opening in browser: $1'
+                            );
+
+                            const emitAuthUrl = (detectedUrl: string, autoOpen = false) => {
+                                const normalizedUrl = normalizeDetectedUrl(detectedUrl);
+                                if (!normalizedUrl || !session.ws || session.ws.readyState !== WebSocket.OPEN) return;
+
+                                const isNewUrl = !announcedAuthUrls.has(normalizedUrl);
+                                if (isNewUrl) {
+                                    announcedAuthUrls.add(normalizedUrl);
+                                    session.ws.send(JSON.stringify({
+                                        type: 'auth_url',
+                                        url: normalizedUrl,
+                                        autoOpen
+                                    }));
+                                }
+                            };
+
+                            const normalizedDetectedUrls: string[] = (extractUrlsFromText(urlDetectionBuffer) as string[])
+                                .map((url: string) => normalizeDetectedUrl(url))
+                                .filter((url: string | null): url is string => Boolean(url));
+
+                            // Prefer the most complete URL if shorter prefix variants are also present.
+                            const dedupedDetectedUrls = Array.from(new Set(normalizedDetectedUrls)).filter((url: string, _: number, urls: string[]) =>
+                                !urls.some((otherUrl) => otherUrl !== url && otherUrl.startsWith(url))
+                            );
+
+                            dedupedDetectedUrls.forEach((url) => emitAuthUrl(url, false));
+
+                            if (shouldAutoOpenUrlFromOutput(cleanChunk) && dedupedDetectedUrls.length > 0) {
+                                const bestUrl = dedupedDetectedUrls.reduce((longest: string, current: string) =>
+                                    current.length > longest.length ? current : longest
+                                );
+                                emitAuthUrl(bestUrl, true);
+                            }
+
+                            queueShellOutput({
+                                session,
+                                data: outputData,
+                                isPlainShell,
+                                WebSocketState: WebSocket,
+                            });
+                        });
+
+                        // Handle process exit
+                        spawnedShellProcess.onExit((exitCode: { exitCode: number; signal?: string }) => {
+                            console.log('🔚 Shell process exited with code:', exitCode.exitCode, 'signal:', exitCode.signal);
+                            const session = ptySessionsMap.get(ptySessionKey);
+                            if (session && session.pty !== spawnedShellProcess) {
+                                return;
+                            }
+                            if (session) {
+                                flushShellOutput(session, WebSocket);
+                            }
+                            if (session && session.ws && session.ws.readyState === WebSocket.OPEN) {
+                                session.ws.send(JSON.stringify({
+                                    type: 'output',
+                                    data: `\r\n\x1b[33mProcess exited with code ${exitCode.exitCode}${exitCode.signal ? ` (${exitCode.signal})` : ''}\x1b[0m\r\n`
+                                }));
+                            }
+                            if (session && session.timeoutId) {
+                                clearTimeout(session.timeoutId);
+                            }
+                            if (session) {
+                                resetShellOutputQueue(session);
+                            }
+                            ptySessionsMap.delete(ptySessionKey);
+                            shellProcess = null;
+                        });
+
+                    } catch (spawnError: any) {
+                        console.error('[ERROR] Error spawning process:', spawnError);
+                        ws.send(JSON.stringify({
+                            type: 'output',
+                            data: `\r\n\x1b[31mError: ${spawnError.message}\x1b[0m\r\n`
+                        }));
+                    }
+
+                } else if (data.type === 'ping') {
+                    ws.send(JSON.stringify({
+                        type: 'pong',
+                        timestamp: data.timestamp || Date.now()
+                    }));
+                } else if (data.type === 'input') {
+                    // Send input to shell process
+                    if (shellProcess && shellProcess.write) {
+                        try {
+                            if (ptySessionKey) {
+                                const session = ptySessionsMap.get(ptySessionKey);
+                                if (session && !session.isPlainShell) {
+                                    markShellOutputInteractive(session, WebSocket);
+                                }
+                            }
+                            shellProcess.write(data.data);
+                        } catch (error: any) {
+                            console.error('Error writing to shell:', error);
+                        }
+                    } else {
+                        console.warn('No active shell process to send input to');
+                    }
+                } else if (data.type === 'resize') {
+                    // Handle terminal resize
+                    if (shellProcess && shellProcess.resize) {
+                        console.log('Terminal resize requested:', data.cols, 'x', data.rows);
+                        shellProcess.resize(data.cols, data.rows);
+                    }
+                } else if (data.type === 'kill_terminal' || data.type === 'terminateTerminal' || data.type === 'deleteTerminal') {
+                    if (ptySessionKey) {
+                        const tmuxRuntime = createTmuxTerminalRuntime(ptySessionKey);
+                        const session = ptySessionsMap.get(ptySessionKey);
+                        const targetTmuxTarget = session?.tmuxTarget || tmuxRuntime.target;
+                        const terminateArgs = tmuxRuntime.terminateTerminal(targetTmuxTarget);
+                        console.log('🧹 Explicit terminal termination requested:', terminateArgs.join(' '));
+                        cancelTmuxCleanup([targetTmuxTarget]);
+                        executeTmuxLifecycleCommand(terminateArgs.slice(1), terminateArgs[1]);
+                        if (session?.timeoutId) {
+                            clearTimeout(session.timeoutId);
+                        }
+                        if (session) {
+                            resetShellOutputQueue(session);
+                        }
+                        if (session?.pty && session.pty.kill) {
+                            session.pty.kill();
+                        }
+                        ptySessionsMap.delete(ptySessionKey);
+                    }
+                }
+            } catch (error: any) {
+                console.error('[ERROR] Shell WebSocket error:', error.message);
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'output',
+                        data: `\r\n\x1b[31mError: ${error.message}\x1b[0m\r\n`
+                    }));
+                }
+            }
+        });
+
+        ws.on('close', () => {
+            console.log('🔌 Shell client disconnected');
+
+            if (ptySessionKey) {
+                const session = ptySessionsMap.get(ptySessionKey);
+                if (session) {
+                    console.log('⏳ Terminal websocket detached; tmux session remains available:', ptySessionKey);
+                    if (session.ws !== ws) {
+                        console.log('ℹ️  Ignoring stale shell socket close because session already moved to a newer websocket');
+                        return;
+                    }
+
+                    if (session.tmuxTarget || session.tmuxSessionName) {
+                        const tmuxRuntime = createTmuxTerminalRuntime(ptySessionKey);
+                        const activeTarget = session.tmuxTarget || session.tmuxSessionName;
+                        scheduleTmuxCleanup(tmuxRuntime, activeTarget, PTY_SESSION_TIMEOUT);
+                        resetShellOutputQueue(session);
+                        ptySessionsMap.delete(ptySessionKey);
+                        if (session.pty && session.pty.kill) {
+                            session.pty.kill();
+                        }
+                    }
+                    session.ws = null;
+                }
+            }
+        });
+
+        ws.on('error', (error: Error) => {
+            console.error('[ERROR] Shell WebSocket error:', error);
+        });
+    }
+    runShellConnection(ws);
+}

@@ -1,0 +1,238 @@
+/**
+ * Sources: 2026-07-06-37-终端统一入口与tmux保活, 41-接入Claude-Code会话与tmux-TUI
+ *
+ * PURPOSE: Verify terminal entry, tmux persistence, explicit record view, and
+ * desktop terminal layout stay aligned with the durable terminal contract.
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { pathToFileURL } from 'node:url';
+
+const REPO_ROOT = process.cwd();
+const PROJECT_OVERVIEW_PATH = path.join(
+  REPO_ROOT,
+  'frontend',
+  'components',
+  'main-content',
+  'project-overview',
+  'ProjectOverviewPanelRuntime.impl.tsx',
+);
+const WORKSPACE_NAV_PATH = path.join(REPO_ROOT, 'frontend', 'components', 'app', 'ProjectWorkspaceNav.tsx');
+const MAIN_CONTENT_PATH = path.join(REPO_ROOT, 'frontend', 'components', 'main-content', 'view', 'MainContent.tsx');
+const WORKSPACE_LAYOUT_PATH = path.join(
+  REPO_ROOT,
+  'frontend',
+  'components',
+  'main-content',
+  'view',
+  'subcomponents',
+  'WorkspaceDockLayout.tsx',
+);
+const WORKSPACE_LAYOUT_STATE_PATH = path.join(
+  REPO_ROOT,
+  'frontend',
+  'components',
+  'main-content',
+  'hooks',
+  'useWorkspaceLayoutState.ts',
+);
+const SHELL_CONNECTION_PATH = path.join(REPO_ROOT, 'frontend', 'components', 'shell', 'hooks', 'useShellConnection.ts');
+const SHELL_RUNTIME_PATH = path.join(REPO_ROOT, 'frontend', 'components', 'shell', 'hooks', 'useShellRuntime.ts');
+const SHELL_VIEW_PATH = path.join(REPO_ROOT, 'frontend', 'components', 'shell', 'view', 'Shell.tsx');
+const SHELL_TYPES_PATH = path.join(REPO_ROOT, 'frontend', 'components', 'shell', 'types', 'types.ts');
+const CHAT_INTERFACE_PATH = path.join(REPO_ROOT, 'frontend', 'components', 'chat', 'view', 'ChatInterface.tsx');
+const PROJECT_OVERVIEW_RUNTIME_PATH = path.join(REPO_ROOT, 'frontend', 'components', 'main-content', 'project-overview', 'ProjectOverviewPanelRuntime.impl.tsx');
+const SHELL_WEBSOCKET_PATH = path.join(REPO_ROOT, 'backend', 'server', 'shell-websocket.ts');
+const CODEX_ATTACH_PLAN_PATH = path.join(REPO_ROOT, 'backend', 'server', 'codex-terminal-attach-plan.ts');
+const TMUX_RUNTIME_PATH = path.join(REPO_ROOT, 'backend', 'server', 'terminal-tmux-runtime.ts');
+const SERVER_RUNTIME_PATH = path.join(REPO_ROOT, 'backend', 'server', 'server-runtime.impl.ts');
+
+/**
+ * Read a required source file for stable business-boundary assertions.
+ */
+function readRequiredSource(filePath: string, businessName: string): string {
+  assert.equal(fs.existsSync(filePath), true, `缺少 ${businessName}: ${path.relative(REPO_ROOT, filePath)}`);
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+/**
+ * Read source files involved in session-card and new-session terminal entry.
+ */
+function readSessionEntrySources(): {
+  overviewSource: string;
+  combinedSource: string;
+} {
+  const overviewSource = readRequiredSource(PROJECT_OVERVIEW_PATH, '项目总览Session 卡片');
+  const combinedSource = [
+    overviewSource,
+    readRequiredSource(WORKSPACE_NAV_PATH, '工作区Session 导航'),
+    readRequiredSource(MAIN_CONTENT_PATH, '主工作区'),
+    readRequiredSource(SHELL_CONNECTION_PATH, 'Terminal连接 hook'),
+    readRequiredSource(CHAT_INTERFACE_PATH, 'Session 记录视图'),
+    readRequiredSource(PROJECT_OVERVIEW_RUNTIME_PATH, '项目总览NewSession 入口'),
+  ].join('\n');
+
+  return { overviewSource, combinedSource };
+}
+
+/**
+ * Read desktop layout sources that can restore or render terminal placement.
+ */
+function readDesktopLayoutSources(): string {
+  return [
+    readRequiredSource(MAIN_CONTENT_PATH, '主工作区'),
+    readRequiredSource(WORKSPACE_LAYOUT_PATH, '工作区 dock 布局'),
+    readRequiredSource(WORKSPACE_LAYOUT_STATE_PATH, '工作区布局状态'),
+  ].join('\n');
+}
+
+test('Session 卡片用 cN 短路由打开 chat 内保活 TUI', () => {
+  const { overviewSource, combinedSource } = readSessionEntrySources();
+
+  assert.match(
+    overviewSource,
+    /handleSessionCardClick[\s\S]{0,1000}onOpenSessionTerminal\(session\)/,
+    'Session 卡片点击必须通过Terminal入口选择Session ',
+  );
+  assert.match(
+    combinedSource,
+    /handleOpenSessionTerminal[\s\S]{0,260}setActiveTab\(['"]chat['"]\)[\s\S]{0,260}onSelectSession\(session\)/,
+    'Session 入口必须先切到 chat 内 TUI，再复用现有Session 短路由导航',
+  );
+  assert.match(
+    combinedSource,
+    /<StandaloneShell[\s\S]{0,260}session=\{selectedSession\}[\s\S]{0,260}isPlainShell=\{!selectedSession\}/,
+    'Terminal恢复必须从当前 selectedSession 传递Session 身份',
+  );
+  assert.doesNotMatch(
+    combinedSource,
+    /terminalLaunchCommand|terminalSessionId|terminalProviderSessionId|terminalRouteIndex|terminalSessionProvider/,
+    'Session 卡片入口不得把启动命令或Session 身份写入 URL Queries参数',
+  );
+  assert.match(combinedSource, /project-new-session-provider-\$\{provider\}/, 'NewSession 必须按 provider 生成稳定入口');
+  assert.match(combinedSource, /provider === 'codex'[\s\S]{0,100}provider === 'pi'[\s\S]{0,100}Claude Code/, 'NewSession 必须保留 Codex、Pi 和 Claude 标识');
+  assert.doesNotMatch(
+    combinedSource,
+    /会话终端|managedSessionTerminal|sessionTerminalOnly|isSessionTerminal/,
+    '界面和前端状态不应引入“Session Terminal”用户概念',
+  );
+});
+
+test('移动端Session Terminal传递 cN 身份而不是降级为普通 Shell', () => {
+  /** 锁定移动分支，避免桌面分支的正确属性掩盖移动端回归。 */
+  const mainContentSource = readRequiredSource(MAIN_CONTENT_PATH, '主工作区');
+  const mobileWorkspaceSource = mainContentSource.match(
+    /const renderMobileWorkspace[\s\S]*?const renderMobileShell/,
+  )?.[0] || '';
+
+  assert.match(mobileWorkspaceSource, /session=\{selectedSession\}/, 'Move terminal必须传递选中的 cN Session ');
+  assert.match(mobileWorkspaceSource, /isPlainShell=\{!selectedSession\}/, '仅无Session 时才能打开普通 Shell');
+  assert.match(
+    mobileWorkspaceSource,
+    /key=\{`[^`]*\$\{selectedSession\?\.__provider[^`]*\$\{selectedSession\?\.id/,
+    'Move terminal实例键必须包含 provider 和 session，切换Session 时才能重建连接',
+  );
+});
+
+test('tmux 按项目承载Terminal并延迟回收断开的 window', () => {
+  const shellSource = readRequiredSource(SHELL_WEBSOCKET_PATH, 'shell WebSocket relay');
+  const runtimeSource = readRequiredSource(TMUX_RUNTIME_PATH, 'tmux terminal runtime');
+  const shellRuntimeSource = readRequiredSource(SHELL_RUNTIME_PATH, '前端 shell runtime');
+  const mainContentSource = readRequiredSource(MAIN_CONTENT_PATH, '主工作区Terminal视图');
+  const serverRuntimeSource = readRequiredSource(SERVER_RUNTIME_PATH, '后端Terminal回收配置');
+  const combinedSource = `${shellSource}\n${runtimeSource}`;
+
+  assert.match(combinedSource, /\btmux\b/, '后端必须显式使用 tmux 承载Terminal');
+  assert.match(combinedSource, /has-session|list-sessions/, '后端必须能检测已有 tmux session');
+  assert.match(combinedSource, /new-session|new\s+-d|-d\s+-s/, '后端必须能创建后台 tmux session');
+  assert.match(combinedSource, /new-window/, '同项目的New session必须创建独立 window');
+  assert.match(combinedSource, /attach-session|attach\s+-t|capture-pane/, '后端必须能重新 attach 或读取 session');
+  assert.match(shellSource, /pane_current_path/, '复连前必须检查 tmux pane 的工作目录');
+  assert.match(shellSource, /!\s*-d[\s\S]{0,40}pane_path/, '失效工作目录必须被识别');
+  assert.match(shellSource, /tmux kill-session/, '失效工作目录对应的 tmux session 必须被清理');
+  assert.match(combinedSource, /send-keys|load-buffer|paste-buffer/, '启动命令必须通过 tmux 输入通道注入');
+  assert.doesNotMatch(shellSource, /keepSessionAliveOnDisconnect\s*=\s*!isPlainShell/, '普通 shell 和 TUI 不得分叉保活策略');
+  assert.match(shellSource, /scheduleTmuxCleanup/, 'WebSocket close 必须进入延迟回收链路');
+  assert.match(shellSource, /readTmuxActivityMarker/, '后台仍有输出时必须顺延回收');
+  assert.match(serverRuntimeSource, /PTY_SESSION_TIMEOUT\s*=\s*5\s*\*\s*60\s*\*\s*1000/, '静默 window 必须在五分钟宽限期后回收');
+  assert.match(shellSource, /execFile\(['"]tmux['"]/, 'tmux 生命周期命令必须真实Execution');
+  assert.match(
+    shellSource,
+    /terminateTerminal\(targetTmuxTarget\)[\s\S]{0,300}executeTmuxLifecycleCommand/,
+    '显式终止路径必须实际关闭对应 tmux window',
+  );
+  assert.match(shellRuntimeSource, /type:\s*['"]kill_terminal['"]/, '前端必须能发送终止Terminal消息');
+  assert.match(
+    mainContentSource,
+    /terminalTerminateHandlersRef\.current\.get\(activeTerminalId\)\?\.\(\)/,
+    'Delete活动Terminal必须调用当前Terminal的显式终止函数',
+  );
+});
+
+test('tmux session 使用项目身份，window 使用 provider 和 cN 路由', async () => {
+  const runtimeModule = await import(pathToFileURL(TMUX_RUNTIME_PATH).href);
+
+  const rawKey = '/home/example/projects/agentporch_codex_route:c7';
+  assert.match(
+    runtimeModule.createTmuxSessionName(rawKey),
+    /^agentporch_projects_agentporch_[a-f0-9]{8}$/,
+    'tmux session 应由可读项目名和防冲突后缀组成',
+  );
+  assert.equal(runtimeModule.createTmuxWindowName(rawKey), 'codex_c7', 'window 应呈现 provider 和短路由');
+  assert.match(
+    runtimeModule.createLegacyTmuxSessionName('/home/example/projects/agentporch_codex_route:c7'),
+    /^agentporch_[A-Za-z0-9_-]+$/,
+    '旧 base64 名称必须保留，供已有 tmux Session 兼容复连',
+  );
+});
+
+test('旧式Session 强制接管必须先警告并绑定新式共享Session ', () => {
+  /** 用户确认后由后端创建共享线程并绑定同一卡片，前端不得自行制造 provider 身份。 */
+  const shellViewSource = readRequiredSource(SHELL_VIEW_PATH, 'Shell 接管警告');
+  const shellConnectionSource = readRequiredSource(SHELL_CONNECTION_PATH, 'Shell 接管协议');
+  const shellTypesSource = readRequiredSource(SHELL_TYPES_PATH, 'Shell 接管类型');
+  const backendSource = readRequiredSource(SHELL_WEBSOCKET_PATH, 'Shell WebSocket relay');
+  const attachPlanSource = readRequiredSource(CODEX_ATTACH_PLAN_PATH, 'Codex 接管规划器');
+
+  assert.match(shellViewSource, /force-codex-handoff/, '警告栏必须提供明确的强制接管按钮');
+  assert.match(shellViewSource, /window\.confirm/, '强制接管必须二次确认风险');
+  assert.match(shellTypesSource, /forceHandoff\?:\s*boolean/, 'init 协议必须显式表达强制接管');
+  assert.match(shellConnectionSource, /forceHandoff:\s*true/, '确认后必须复用当前 init 身份发送强制请求');
+  assert.match(backendSource, /handoff-warning/, '普通打开旧式活动Session 只能返回警告');
+  assert.match(backendSource, /handoff-force-started/, '服务端接受确认后必须回执接管开始');
+  assert.match(backendSource, /beginCodexRemoteTuiThreadCapture/, '强制接管必须由共享 daemon 建立线程');
+  assert.match(backendSource, /writeProviderSessionBinding/, '共享线程必须绑定回原 AgentPorch 卡片');
+  assert.match(
+    attachPlanSource,
+    /action:\s*'new-shared-tui'/,
+    '活动旧线程的强制分支必须显式建立共享Session ',
+  );
+});
+
+test('记录视图显式打开，桌面Terminal作为主工作区视图', () => {
+  const layoutSource = readDesktopLayoutSources();
+  const chatSource = readRequiredSource(CHAT_INTERFACE_PATH, 'Session 记录渲染视图');
+
+  assert.doesNotMatch(
+    layoutSource,
+    /bottomDock|BottomDock|dock-panel-bottom|moveTerminalToBottom|onBottomDock/,
+    '桌面Terminal应迁移为主工作区平行视图，不应保留 bottom dock Terminal状态',
+  );
+  assert.match(
+    layoutSource,
+    /activeTab\s*={0,2}\s*['"]shell['"]|terminalMainView|workspaceTerminalView|<StandaloneShell/,
+    '桌面主工作区必须仍然能渲染Terminal视图',
+  );
+  assert.match(
+    chatSource,
+    /renderSnapshotRequestId|renderSnapshot|会话记录|记录视图|查看记录|详情/i,
+    '必须保留用户主动查看 JSONL 渲染内容的记录/详情入口',
+  );
+  assert.doesNotMatch(
+    chatSource,
+    /selectedSession[\s\S]{0,240}loadSessionMessages\(/,
+    '默认选中Session 不应立即把 JSONL 加载作为唯一主视图',
+  );
+});

@@ -1,0 +1,199 @@
+// @ts-nocheck -- better-sqlite3 runtime fixtures keep migration assertions compact.
+/**
+ * PURPOSE: Verify the provider session SQLite read model persists session
+ * ownership metadata used by project overview manual-session filtering.
+ */
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import Database from 'better-sqlite3';
+
+import { providerSessionIndexDb } from '../../backend/provider-session-index-store.ts';
+
+/**
+ * Create the pre-origin provider index schema used by existing installations.
+ */
+function createLegacyProviderSessionIndex(db) {
+  /**
+   * PURPOSE: Exercise the store's self-healing migration path instead of only
+   * testing freshly initialized databases.
+   */
+  db.exec(`
+    CREATE TABLE provider_session_index (
+      provider TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      source_session_id TEXT,
+      project_path TEXT NOT NULL,
+      normalized_project_path TEXT NOT NULL,
+      summary TEXT,
+      title TEXT,
+      model TEXT,
+      thread TEXT,
+      session_file_name TEXT,
+      file_path TEXT NOT NULL,
+      created_at TEXT,
+      last_activity TEXT NOT NULL,
+      message_count INTEGER,
+      message_count_known INTEGER DEFAULT 0,
+      file_mtime_ms REAL DEFAULT 0,
+      indexed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (provider, session_id)
+    );
+  `);
+}
+
+test('provider session index migrates old rows and persists workflow origin', () => {
+  const db = new Database(':memory:');
+  try {
+    createLegacyProviderSessionIndex(db);
+
+    providerSessionIndexDb.upsert(db, {
+      provider: 'pi',
+      id: 'pi-workflow-child',
+      origin: 'workflow',
+      projectPath: '/tmp/agentporch-provider-index-origin',
+      title: 'workflow state owned session',
+      routeTitle: 'workflow state',
+      filePath: '/tmp/pi-workflow-child.jsonl',
+      createdAt: '2026-06-13T01:00:00.000Z',
+      lastActivity: '2026-06-13T01:00:01.000Z',
+    });
+
+    const columns = db.prepare('PRAGMA table_info(provider_session_index)').all();
+    assert.equal(columns.some((column) => column.name === 'origin'), true);
+    assert.equal(columns.some((column) => column.name === 'route_title'), true);
+
+    const sessions = providerSessionIndexDb.listForProject(db, 'pi', '/tmp/agentporch-provider-index-origin', 10);
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].id, 'pi-workflow-child');
+    assert.equal(sessions[0].origin, 'workflow');
+    assert.equal(sessions[0].routeTitle, 'workflow state');
+
+    providerSessionIndexDb.upsert(db, {
+      provider: 'pi',
+      id: 'pi-workflow-child',
+      projectPath: '/tmp/agentporch-provider-index-origin',
+      title: 'workflow state owned session',
+      filePath: '/tmp/pi-workflow-child.jsonl',
+      createdAt: '2026-06-13T01:00:00.000Z',
+      lastActivity: '2026-06-13T01:00:02.000Z',
+    });
+
+    const updatedSessions = providerSessionIndexDb.listForProject(db, 'pi', '/tmp/agentporch-provider-index-origin', 10);
+    assert.equal(updatedSessions[0].origin, 'workflow');
+  } finally {
+    db.close();
+  }
+});
+
+test('provider session index ignores unknown origin labels', () => {
+  const db = new Database(':memory:');
+  try {
+    providerSessionIndexDb.upsert(db, {
+      provider: 'codex',
+      id: 'codex-provider-session',
+      origin: 'external',
+      projectPath: '/tmp/agentporch-provider-index-origin',
+      title: 'ordinary provider session',
+      filePath: '/tmp/codex-provider-session.jsonl',
+      createdAt: '2026-06-13T02:00:00.000Z',
+      lastActivity: '2026-06-13T02:00:01.000Z',
+    });
+
+    const sessions = providerSessionIndexDb.listForProject(db, 'codex', '/tmp/agentporch-provider-index-origin', 10);
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].origin, undefined);
+  } finally {
+    db.close();
+  }
+});
+
+test('provider session index locates Claude transcript by session identity', () => {
+  /** PURPOSE: Keep explicit Claude history requests off recursive HOME scans. */
+  const db = new Database(':memory:');
+  try {
+    providerSessionIndexDb.upsert(db, {
+      provider: 'claude',
+      id: 'claude-indexed-session',
+      projectPath: '/tmp/agentporch-claude-indexed-project',
+      title: 'indexed Claude session',
+      filePath: '/tmp/claude-indexed-session.jsonl',
+      createdAt: '2026-07-18T02:00:00.000Z',
+      lastActivity: '2026-07-18T02:00:01.000Z',
+    });
+
+    assert.equal(
+      providerSessionIndexDb.getFilePath(db, 'claude', 'claude-indexed-session'),
+      '/tmp/claude-indexed-session.jsonl',
+    );
+    assert.equal(providerSessionIndexDb.getFilePath(db, 'claude', 'missing-session'), '');
+  } finally {
+    db.close();
+  }
+});
+
+test('provider session index only advances activity revision when file fingerprint changes', () => {
+  /** PURPOSE: Repeated watcher and startup backfill reads must not create false pending activity. */
+  const db = new Database(':memory:');
+  try {
+    const baseRecord = {
+      provider: 'codex',
+      id: 'codex-revision-session',
+      projectPath: '/tmp/agentporch-provider-index-revision',
+      title: 'revision session',
+      filePath: '/tmp/codex-revision-session.jsonl',
+      createdAt: '2026-07-21T00:00:00.000Z',
+      lastActivity: '2026-07-21T00:00:01.000Z',
+      fileMtimeMs: 1_750_000_000_001,
+    };
+    providerSessionIndexDb.upsert(db, baseRecord);
+    providerSessionIndexDb.upsert(db, baseRecord);
+    assert.equal(
+      db.prepare('SELECT activity_revision FROM provider_session_index').get().activity_revision,
+      1,
+    );
+
+    providerSessionIndexDb.upsert(db, {
+      ...baseRecord,
+      lastActivity: '2026-07-21T00:00:02.000Z',
+      fileMtimeMs: 1_750_000_000_002,
+    });
+    assert.equal(
+      db.prepare('SELECT activity_revision FROM provider_session_index').get().activity_revision,
+      2,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('provider session index returns stored transcript version fields without schema migration', () => {
+  /** PURPOSE: Search caches can validate indexed transcripts without touching JSONL files. */
+  const db = new Database(':memory:');
+  try {
+    createLegacyProviderSessionIndex(db);
+    db.exec('ALTER TABLE provider_session_index ADD COLUMN file_size INTEGER');
+    providerSessionIndexDb.upsert(db, {
+      provider: 'codex',
+      id: 'codex-versioned-session',
+      projectPath: '/tmp/agentporch-provider-index-version',
+      title: 'versioned session',
+      filePath: '/tmp/codex-versioned-session.jsonl',
+      lastActivity: '2026-08-24T00:00:00.000Z',
+      fileMtimeMs: 1_777_777_777_777,
+    });
+    db.prepare('UPDATE provider_session_index SET file_size = ? WHERE session_id = ?')
+      .run(4096, 'codex-versioned-session');
+
+    const [session] = providerSessionIndexDb.listForProject(
+      db,
+      'codex',
+      '/tmp/agentporch-provider-index-version',
+      10,
+    );
+    assert.equal(session.fileMtimeMs, 1_777_777_777_777);
+    assert.equal(session.fileSize, 4096);
+  } finally {
+    db.close();
+  }
+});

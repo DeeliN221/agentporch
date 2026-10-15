@@ -1,0 +1,382 @@
+// Sources: 3-拆分Provider会话列表读模型
+/**
+ * 文件目的：验证 Provider 会话列表 read model 的长期业务规格。
+ * 业务意义：项目首页普通会话列表必须合并手动 cN 路由，隐藏重复底层 provider session，并过滤 workflow 子会话。
+ */
+import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+
+import { buildProviderSessionListReadModel } from '../../backend/domains/projects/provider-session-list-read-model.ts';
+
+/**
+ * 写入规格测试运行后的状态快照，供 QA 或回归排查复核。
+ */
+async function writeEvidenceSnapshot(fileName: string, payload: unknown): Promise<void> {
+  /**
+   * PURPOSE: Store runtime evidence for Provider session list behavior without
+   * committing generated artifacts to the repository.
+   */
+  const evidenceDir = path.join(process.cwd(), 'test-results', 'provider-session-list');
+  await fs.mkdir(evidenceDir, { recursive: true });
+  await fs.writeFile(path.join(evidenceDir, fileName), `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+}
+
+test('Provider Session 列表Hide已绑定 cN 的原始 session 并过滤 workflow-owned session', async () => {
+  /**
+   * 业务场景：项目首页普通手动会话只显示用户可点击的 cN 会话，不重复显示底层 provider JSONL。
+   */
+  const output = buildProviderSessionListReadModel({
+    provider: 'codex',
+    providerSessions: [
+      {
+        id: 'provider-visible',
+        title: '普通 Codex Session ',
+        lastActivity: '2026-06-14T10:00:00.000Z',
+      },
+      {
+        id: 'provider-bound',
+        title: '已绑定到底层 JSONL',
+        lastActivity: '2026-06-14T11:00:00.000Z',
+      },
+      {
+        id: 'workflow-child',
+        title: 'Workflow child session',
+        lastActivity: '2026-06-14T12:00:00.000Z',
+      },
+    ],
+    manualDrafts: [
+      {
+        id: 'c1',
+        routeIndex: 1,
+        provider: 'codex',
+        providerSessionId: 'provider-bound',
+        title: '手动路由Session ',
+        lastActivity: '2026-06-14T13:00:00.000Z',
+      },
+    ],
+    workflowOwnedSessionIds: new Set(['workflow-child']),
+    excludeWorkflowChildSessions: true,
+    includeHidden: false,
+  });
+
+  assert.deepEqual(output.map((session) => session.id), ['c1', 'provider-visible']);
+  assert.equal(output[0].routeIndex, 1);
+  assert.equal(output[0].providerSessionId, 'provider-bound');
+  assert.equal(output.some((session) => session.id === 'provider-bound'), false);
+  assert.equal(output.some((session) => session.id === 'workflow-child'), false);
+
+  await writeEvidenceSnapshot('read-model-output.json', output);
+});
+
+test('Provider Session 列表不会让缺失时间的旧 cN 路由挤掉最近 provider Session ', async () => {
+  /**
+   * 业务场景：旧版本自动导入的 cN 路由可能没有 createdAt/updatedAt；
+   * 它们不能被当成“刚刚活动”排在真实新 JSONL 会话之前。
+   */
+  const output = buildProviderSessionListReadModel({
+    provider: 'codex',
+    providerSessions: [
+      {
+        id: 'recent-provider-session',
+        title: '刚创建的真实 Codex Session ',
+        lastActivity: '2026-06-18T06:30:00.000Z',
+      },
+    ],
+    manualDrafts: [
+      {
+        id: 'old-routed-session',
+        routeIndex: 1,
+        provider: 'codex',
+        title: '旧 cN 路由',
+      },
+    ],
+    excludeWorkflowChildSessions: true,
+    includeHidden: true,
+  });
+
+  assert.equal(output[0].id, 'recent-provider-session');
+  assert.equal(output[1].id, 'old-routed-session');
+
+  await writeEvidenceSnapshot('untimestamped-route-order.json', output);
+});
+
+test('Provider Session 列表用真实用户请求Repair旧的 AGENTS 内部路由Title', () => {
+  /**
+   * 业务场景：旧版本把 Codex 注入的 AGENTS.md 内容写进 cN 路由后，
+   * 刷新列表应立即恢复为 provider 解析出的首条真实用户请求。
+   */
+  const output = buildProviderSessionListReadModel({
+    provider: 'codex',
+    providerSessions: [
+      {
+        id: 'provider-real-request',
+        title: 'Repair session清单的内部Title',
+        routeTitle: 'Repair session清单的内部Title',
+        lastActivity: '2026-08-25T10:00:00.000Z',
+      },
+    ],
+    manualDrafts: [
+      {
+        id: 'c8',
+        routeIndex: 8,
+        provider: 'codex',
+        providerSessionId: 'provider-real-request',
+        title: '# AGENTS.md instructions for /Users/example/dotfiles\n\n<INSTRUCTIONS>内部内容</INSTRUCTIONS>',
+        routeTitle: '# AGENTS.md instructions for /Users/example/dotfiles',
+        summary: '# AGENTS.md instructions for /Users/example/dotfiles',
+        lastActivity: '2026-08-25T10:00:01.000Z',
+      },
+    ],
+  });
+
+  assert.equal(output.length, 1);
+  assert.equal(output[0].id, 'c8');
+  assert.equal(output[0].title, 'Repair session清单的内部Title');
+  assert.equal(output[0].routeTitle, 'Repair session清单的内部Title');
+  assert.equal(output[0].summary, 'Repair session清单的内部Title');
+});
+
+test('Provider Session 列表过滤旧版本误标为 manual 的 workflow 角色提示Session ', async () => {
+  /**
+   * 业务场景：历史 workflow 子会话曾以 cN manual route 形态持久化，项目首页不能把这些内部角色会话展示成手动会话。
+   */
+  const output = buildProviderSessionListReadModel({
+    provider: 'pi',
+    providerSessions: [
+      {
+        id: 'legacy-workflow-role-provider',
+        title: '你是 回归场景Test员，职责：覆盖邻近功能',
+        lastActivity: '2026-06-17T09:00:00.000Z',
+      },
+      {
+        id: 'manual-provider-thread',
+        title: '用户直接创建的 Pi Manual sessions',
+        lastActivity: '2026-06-17T10:00:00.000Z',
+      },
+    ],
+    manualDrafts: [
+      {
+        id: 'c72',
+        routeIndex: 72,
+        provider: 'pi',
+        origin: 'manual',
+        providerSessionId: 'legacy-workflow-role-provider',
+        title: '你是 回归场景Test员，职责：覆盖邻近功能',
+        lastActivity: '2026-06-17T11:00:00.000Z',
+      },
+      {
+        id: 'c73',
+        routeIndex: 73,
+        provider: 'pi',
+        origin: 'manual',
+        providerSessionId: 'manual-provider-thread',
+        title: '用户直接创建的 Pi Manual sessions',
+        lastActivity: '2026-06-17T12:00:00.000Z',
+      },
+    ],
+    workflowOwnedSessionIds: new Set(),
+    excludeWorkflowChildSessions: true,
+    includeHidden: true,
+  });
+
+  assert.deepEqual(output.map((session) => session.id), ['c73']);
+  assert.equal(output[0].providerSessionId, 'manual-provider-thread');
+
+  await writeEvidenceSnapshot('legacy-workflow-role-filter.json', output);
+});
+
+test('Provider Session 列表过滤 JSONL 明确标记的内部子代理', () => {
+  /**
+   * PURPOSE: Keep subagents hidden even when an older oz state does not list
+   * their ids, while retaining ordinary top-level provider sessions.
+   */
+  const output = buildProviderSessionListReadModel({
+    provider: 'codex',
+    providerSessions: [
+      {
+        id: 'workflow-subagent',
+        origin: 'workflow',
+        sourceSessionId: 'workflow-root',
+        title: '继承的用户请求',
+      },
+      {
+        id: 'manual-session',
+        title: '用户创建的顶层Session ',
+      },
+    ],
+    manualDrafts: [],
+    workflowOwnedSessionIds: new Set(),
+    excludeWorkflowChildSessions: true,
+    includeHidden: true,
+  });
+
+  assert.deepEqual(output.map((session) => session.id), ['manual-session']);
+});
+
+test('Provider 权威来源覆盖旧 cN 路由的空来源并Hide子代理', () => {
+  /**
+   * PURPOSE: Reproduce a stale auto-import route created before Codex subagent
+   * metadata was indexed; the repaired provider header must remain authoritative.
+   */
+  const output = buildProviderSessionListReadModel({
+    provider: 'codex',
+    providerSessions: [
+      {
+        id: 'stale-routed-subagent',
+        origin: 'workflow',
+        sourceSessionId: 'top-level-parent',
+        title: '与父Session 相同的继承请求',
+        lastActivity: '2026-07-14T02:00:00.000Z',
+      },
+      {
+        id: 'top-level-parent',
+        title: '用户创建的顶层Session ',
+        lastActivity: '2026-07-14T01:59:00.000Z',
+      },
+    ],
+    manualDrafts: [
+      {
+        id: 'stale-routed-subagent',
+        routeIndex: 415,
+        provider: 'codex',
+        providerSessionId: 'stale-routed-subagent',
+        origin: undefined,
+        title: '与父Session 相同的继承请求',
+      },
+    ],
+    workflowOwnedSessionIds: new Set(),
+    excludeWorkflowChildSessions: true,
+    includeHidden: true,
+  });
+
+  assert.deepEqual(output.map((session) => session.id), ['top-level-parent']);
+});
+
+test('TerminalManual sessions的 Provider 首条请求替换 cN 占位Title', () => {
+  /**
+   * PURPOSE: Reproduce a Codex TUI route that was bound after creation but did
+   * not pass through the WebSocket chat command title update.
+   */
+  const firstRequest = '前端的Manual sessions列表请改成纵向平铺，并保留Session Title';
+  const output = buildProviderSessionListReadModel({
+    provider: 'codex',
+    providerSessions: [{
+      id: 'provider-session-479',
+      title: firstRequest,
+      routeTitle: Array.from(firstRequest).slice(0, 20).join(''),
+      summary: 'Codex Session',
+      lastActivity: '2026-07-21T07:28:34.034Z',
+    }],
+    manualDrafts: [{
+      id: 'provider-session-479',
+      routeIndex: 479,
+      provider: 'codex',
+      providerSessionId: 'provider-session-479',
+      origin: 'manual',
+      title: 'Session 479',
+      routeTitle: 'Session 479',
+      summary: 'Session 479',
+    }],
+    excludeWorkflowChildSessions: true,
+    includeHidden: true,
+  });
+
+  assert.equal(output.length, 1);
+  assert.equal(output[0].title, firstRequest);
+  assert.equal(output[0].routeTitle, Array.from(firstRequest).slice(0, 20).join(''));
+  assert.equal(output[0].summary, 'Codex Session');
+  assert.equal(output[0].routeIndex, 479);
+});
+
+test('TerminalManual sessions保留用户自定义Title', () => {
+  /**
+   * PURPOSE: Provider title repair must never replace a route title explicitly
+   * chosen by the user.
+   */
+  const output = buildProviderSessionListReadModel({
+    provider: 'codex',
+    providerSessions: [{
+      id: 'provider-session-custom',
+      title: 'Provider 首条请求',
+      routeTitle: 'Provider 首条请求',
+      summary: 'Codex Session',
+    }],
+    manualDrafts: [{
+      id: 'provider-session-custom',
+      routeIndex: 480,
+      provider: 'codex',
+      providerSessionId: 'provider-session-custom',
+      title: '我设置的Title',
+      routeTitle: '我设置的Title',
+      summary: '我设置的Title',
+    }],
+    excludeWorkflowChildSessions: true,
+    includeHidden: true,
+  });
+
+  assert.equal(output[0].title, '我设置的Title');
+  assert.equal(output[0].routeTitle, '我设置的Title');
+  assert.equal(output[0].summary, '我设置的Title');
+});
+
+test('旧版五十字符自动摘要会由 Provider 完整TitleRepair', () => {
+  /** 历史自动摘要不是用户重命名，重新索引时应恢复完整首条请求。 */
+  const fullTitle = '请完整保留这个已经明显超过五十个字符的Session Title，因为Pending卡片会根据实际屏幕宽度显示一至两行，而不是依赖后端固定字符数截断';
+  const legacyTitle = `${Array.from(fullTitle).slice(0, 50).join('')}...`;
+  const output = buildProviderSessionListReadModel({
+    provider: 'codex',
+    providerSessions: [{
+      id: 'legacy-auto-summary',
+      title: fullTitle,
+      routeTitle: Array.from(fullTitle).slice(0, 20).join(''),
+      summary: 'Codex Session',
+    }],
+    manualDrafts: [{
+      id: 'legacy-auto-summary',
+      routeIndex: 481,
+      provider: 'codex',
+      providerSessionId: 'legacy-auto-summary',
+      title: legacyTitle,
+      routeTitle: Array.from(fullTitle).slice(0, 20).join(''),
+      summary: legacyTitle,
+    }],
+    includeHidden: true,
+  });
+
+  assert.equal(output[0].title, fullTitle);
+  assert.equal(output[0].summary, 'Codex Session');
+});
+
+test('projects.ts 调用 Provider Session 列表 read model 而不是内联核心过滤规则', async () => {
+  /**
+   * 业务场景：后续修复项目首页会话展示时，开发者能先改项目域小模块和小测试，
+   * backend/projects.ts 只保留兼容导出。
+   */
+  const projectsSource = await fs.readFile(path.join(process.cwd(), 'backend/projects.ts'), 'utf8');
+  const domainServiceSource = await fs.readFile(
+    path.join(process.cwd(), 'backend/domains/projects/project-domain-service.ts'),
+    'utf8',
+  );
+  const readModelSource = await fs.readFile(
+    path.join(process.cwd(), 'backend/domains/projects/provider-session-list-read-model.ts'),
+    'utf8',
+  );
+
+  const audit = {
+    projectsIsFacade: /export \* from '.\/domains\/projects\/project-domain-service\.js'/.test(projectsSource),
+    domainServiceImportsReadModel: /buildProviderSessionListReadModel/.test(domainServiceSource),
+    readModelHandlesBoundProviderSessionIds: /boundProviderSessionIds|providerSessionId/.test(readModelSource),
+    readModelHandlesWorkflowOwnedSessionIds: /workflowOwnedSessionIds/.test(readModelSource),
+    projectsKeepsInlineBoundProviderSet: /const boundProviderSessionIds = new Set/.test(projectsSource),
+  };
+
+  assert.equal(audit.projectsIsFacade, true);
+  assert.equal(audit.domainServiceImportsReadModel, true);
+  assert.equal(audit.readModelHandlesBoundProviderSessionIds, true);
+  assert.equal(audit.readModelHandlesWorkflowOwnedSessionIds, true);
+  assert.equal(audit.projectsKeepsInlineBoundProviderSet, false);
+
+  await writeEvidenceSnapshot('source-audit.json', audit);
+});

@@ -1,0 +1,393 @@
+/**
+ * Define provider transcript and workflow watcher lifecycles.
+ * Keep file-driven project/session/workflow broadcasts separate from HTTP and WebSocket handlers.
+ */
+import path from 'path';
+import { promises as fsPromises } from 'fs';
+import { resolveFlowRunDir } from '../domains/workflows/flow-runtime-paths.js';
+
+type LooseRecord = Record<string, any>;
+
+const WATCHER_DEBOUNCE_MS = 300;
+const GO_RUNNER_WATCH_DEPTH = 1;
+const PROVIDER_WATCH_POLLING_INTERVAL_MS = Number.parseInt(
+    process.env.AGENTPORCH_PROVIDER_WATCH_INTERVAL_MS || process.env.CHOKIDAR_INTERVAL || '1000',
+    10,
+);
+let projectsWatchers: Array<{ close(): Promise<void> | void }> = [];
+const projectsWatcherDebounceTimers = new Map<string, NodeJS.Timeout>();
+const goRunnerWatchers = new Map<string, { close(): Promise<void> | void }>();
+let goRunnerWatcherDebounceTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Refresh project workflow ownership when a new provider session appears.
+ */
+export async function syncWorkflowIndexForNewProviderSession(input: {
+    eventType: string;
+    projectName?: string;
+    projectPath?: string;
+    syncProjectWorkflowOverviewIndex?: (projectPath: string) => Promise<unknown>;
+    ensureGoRunnerWatchersForProjects?: (projects: LooseRecord[], watcher: (project: LooseRecord, workflow: LooseRecord) => Promise<unknown>) => Promise<unknown>;
+    watchGoWorkflowRun: (project: LooseRecord, workflow: LooseRecord) => Promise<unknown>;
+}): Promise<void> {
+    /**
+     * An external oz flow may create a run after server startup; its first provider
+     * transcript is a reliable signal to refresh ownership before notifying the overview.
+     */
+    const projectPath = String(input.projectPath || '').trim();
+    if (input.eventType !== 'add' || !projectPath || typeof input.syncProjectWorkflowOverviewIndex !== 'function') {
+        return;
+    }
+    const workflows = await input.syncProjectWorkflowOverviewIndex(projectPath);
+    if (!Array.isArray(workflows) || typeof input.ensureGoRunnerWatchersForProjects !== 'function') {
+        return;
+    }
+    await input.ensureGoRunnerWatchersForProjects([{
+        name: input.projectName || '',
+        path: projectPath,
+        fullPath: projectPath,
+        workflows,
+    }], input.watchGoWorkflowRun);
+}
+
+/**
+ * Create provider and workflow watcher controllers.
+ */
+export function createProviderWatcherController(deps: any) {
+    const { PROVIDER_WATCH_PATHS, WATCHER_IGNORED_PATTERNS, clearProjectDirectoryCache, deleteProviderSessionIndexFile, getProviderSessionProjectPathForFile, countProviderSessionsForProject, indexProviderSessionFile, upsertProjectIndexFromProviderSession, hideProviderProjectIndex, reconcileHermesSessionIndex, resolveProviderSessionChange, broadcastSessionChanged, broadcastWorkflowChanged, broadcastProjectListInvalidated, attachWorkflowMetadata, syncProjectWorkflowOverviewIndex, getProjects, ensureGoRunnerWatchersForProjects } = deps;
+    /**
+     * Close all provider filesystem watchers and clear any pending debounce work.
+     */
+    async function closeProjectsWatchers() {
+        projectsWatcherDebounceTimers.forEach((timer) => clearTimeout(timer));
+        projectsWatcherDebounceTimers.clear();
+
+        await Promise.all(
+            projectsWatchers.map(async (watcher) => {
+                try {
+                    await watcher.close();
+                } catch (error: any) {
+                    console.error('[WARN] Failed to close watcher:', error);
+                }
+            })
+        );
+        projectsWatchers = [];
+    }
+
+    /**
+     * Provider transcript trees default to native inotify (fs.watch) instead of
+     * polling. agentporch's four watch roots need only ~280 directory watches total —
+     * a rounding error against fs.inotify.max_user_watches (~524k) — so the
+     * historical "inotify exhaustion" that motivated polling was a host-wide
+     * max_user_instances pool issue, not an agentporch footprint problem. Polling every
+     * 1s stat's thousands of session files (~7400 syscalls/s) and shows up as a
+     * constant kernel-time (stime) CPU drain; inotify is event-driven at ~0 idle
+     * cost with millisecond latency.
+     *
+     * Opt back into polling only when the watch root lives on a filesystem that
+     * can't deliver inotify events reliably (NFS/remote mounts), or when a host
+     * genuinely cannot raise its inotify pool. Set AGENTPORCH_PROVIDER_WATCH_USE_POLLING=1.
+     */
+    function shouldUseProviderPolling() {
+        const rawValue = String(process.env.AGENTPORCH_PROVIDER_WATCH_USE_POLLING || process.env.CHOKIDAR_USEPOLLING || '').trim().toLowerCase();
+        return rawValue === '1' || rawValue === 'true' || rawValue === 'yes';
+    }
+
+    /**
+     * Build one provider root watcher, falling back from native inotify to
+     * polling only for the single root that fails to arm (e.g. ENOSPC when the
+     * host inotify pool is genuinely exhausted). Other roots keep using inotify
+     * so a single deficit doesn't force full-tree polling across every provider.
+     */
+    async function createProviderRootWatcher(rootPath: string, provider: string) {
+        const usePolling = shouldUseProviderPolling();
+        const baseOptions: LooseRecord = {
+            ignored: WATCHER_IGNORED_PATTERNS,
+            persistent: true,
+            ignoreInitial: true,
+            followSymlinks: false,
+            depth: 10,
+            awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
+        };
+        const buildOptions = (polling: boolean): LooseRecord => {
+            const opts: LooseRecord = { ...baseOptions, usePolling: polling };
+            if (polling) {
+                const pollIntervalMs = Number.isFinite(PROVIDER_WATCH_POLLING_INTERVAL_MS) && PROVIDER_WATCH_POLLING_INTERVAL_MS > 0
+                    ? PROVIDER_WATCH_POLLING_INTERVAL_MS
+                    : 1000;
+                opts.interval = pollIntervalMs;
+                opts.binaryInterval = pollIntervalMs;
+            }
+            return opts;
+        };
+        try {
+            return { watcher: (await import('chokidar')).default.watch(rootPath, buildOptions(usePolling)), fellBackToPolling: false };
+        } catch (setupError: any) {
+            if (usePolling) throw setupError;
+            // inotify arm failed (typical: ENOSPC/EMFILE on a host-wide pool).
+            // Degrade this one root to polling rather than losing realtime, and
+            // surface it so the operator can raise fs.inotify.* limits.
+            console.warn(
+                `[WARN] ${provider} inotify watcher failed (${setupError?.message || setupError}); falling back to polling for ${rootPath}. ` +
+                `Raising fs.inotify.max_user_watches / max_user_instances restores event-driven realtime.`,
+            );
+            return { watcher: (await import('chokidar')).default.watch(rootPath, buildOptions(true)), fellBackToPolling: true };
+        }
+    }
+
+    /**
+     * Close all Go runner state/log watchers and clear pending broadcasts.
+     */
+    async function closeGoRunnerWatchers() {
+        if (goRunnerWatcherDebounceTimer) {
+            clearTimeout(goRunnerWatcherDebounceTimer);
+            goRunnerWatcherDebounceTimer = null;
+        }
+
+        await Promise.all(
+            Array.from(goRunnerWatchers.values()).map(async (watcher) => {
+                try {
+                    await watcher.close();
+                } catch (error: any) {
+                    console.error('[WARN] Failed to close Go runner watcher:', error);
+                }
+            })
+        );
+        goRunnerWatchers.clear();
+    }
+
+    /**
+     * Debounce Go runner state/log changes into one project refresh broadcast.
+     */
+    function scheduleGoRunnerProjectUpdate(eventType: string, filePath: string, runDir: string, projectName = '', projectPath = '') {
+        if (goRunnerWatcherDebounceTimer) {
+            clearTimeout(goRunnerWatcherDebounceTimer);
+        }
+
+        goRunnerWatcherDebounceTimer = setTimeout(async () => {
+            goRunnerWatcherDebounceTimer = null;
+            if (projectPath && typeof syncProjectWorkflowOverviewIndex === 'function') {
+                try {
+                    await syncProjectWorkflowOverviewIndex(projectPath);
+                } catch (error: any) {
+                    console.warn('[workflow-watch] Failed to sync workflow overview index:', error?.message || error);
+                }
+            }
+            void broadcastWorkflowChanged({
+                changeType: eventType,
+                projectName,
+                projectPath,
+                runId: path.basename(runDir),
+            });
+        }, WATCHER_DEBOUNCE_MS);
+    }
+
+    /**
+     * Watch one Go-backed workflow run directory for state.json and log/artifact
+     * changes that should refresh the workflow read model.
+     */
+    async function watchGoWorkflowRun(project: LooseRecord, workflow: LooseRecord) {
+        const projectPath = project?.fullPath || project?.path || '';
+        const runId = String(workflow?.runId || '').trim();
+        if (workflow?.runner !== 'go' || !projectPath || !runId) {
+            return null;
+        }
+
+        const watcherKey = `${projectPath}:${runId}`;
+        if (goRunnerWatchers.has(watcherKey)) {
+            return goRunnerWatchers.get(watcherKey);
+        }
+
+        const chokidar = (await import('chokidar')).default;
+        const runDir = resolveFlowRunDir(projectPath, runId);
+        await fsPromises.mkdir(runDir, { recursive: true });
+        const watcher = chokidar.watch(runDir, {
+            persistent: true,
+            ignoreInitial: true,
+            followSymlinks: false,
+            // Go read models are rebuilt from state.json and top-level run artifacts.
+            // Deep parallel-member artifact trees can exhaust inotify watches.
+            depth: GO_RUNNER_WATCH_DEPTH,
+            awaitWriteFinish: {
+                stabilityThreshold: 100,
+                pollInterval: 50
+            }
+        });
+
+        const projectName = project?.name || '';
+
+        watcher
+            .on('add', (filePath) => scheduleGoRunnerProjectUpdate('add', filePath, runDir, projectName, projectPath))
+            .on('change', (filePath) => scheduleGoRunnerProjectUpdate('change', filePath, runDir, projectName, projectPath))
+            .on('unlink', (filePath) => scheduleGoRunnerProjectUpdate('unlink', filePath, runDir, projectName, projectPath))
+            .on('error', (error) => {
+                console.error(`[ERROR] Go runner watcher error for ${runId}:`, error);
+            });
+
+        goRunnerWatchers.set(watcherKey, watcher);
+        await new Promise<void>((resolve) => {
+            const readyTimer = setTimeout(resolve, 1000);
+            watcher.once('ready', () => {
+                clearTimeout(readyTimer);
+                resolve();
+            });
+        });
+        return watcher;
+    }
+
+    /**
+     * Recreate Go runner watchers for all visible Go-backed workflows on startup.
+     */
+    async function setupGoRunnerWatchers() {
+        await closeGoRunnerWatchers();
+        const projects = await attachWorkflowMetadata(await getProjects());
+        await ensureGoRunnerWatchersForProjects(projects, watchGoWorkflowRun);
+    }
+
+    // Setup file system watchers for Claude and Codex project/session folders
+    async function setupProjectsWatcher() {
+        const chokidar = (await import('chokidar')).default;
+
+        await closeProjectsWatchers();
+        const readyPromises: Array<Promise<void>> = [];
+
+        const debouncedUpdate = (eventType: string, filePath: string, provider: string, rootPath: string) => {
+            const debounceKey = `${provider}:${filePath}`;
+            const existingTimer = projectsWatcherDebounceTimers.get(debounceKey);
+            if (existingTimer) {
+                clearTimeout(existingTimer);
+            }
+
+            const timer = setTimeout(async () => {
+                projectsWatcherDebounceTimers.delete(debounceKey);
+                try {
+                    clearProjectDirectoryCache();
+                    if (provider === 'hermes') {
+                        const hermesFile = path.basename(filePath).toLowerCase();
+                        if (hermesFile === 'state.db' || hermesFile === 'state.db-wal' || hermesFile === 'state.db-shm') {
+                            await reconcileHermesSessionIndex();
+                            void broadcastProjectListInvalidated({ reason: 'hermes-sqlite-change', changedProjectPath: '' });
+                        }
+                        return;
+                    }
+                    if (!filePath.toLowerCase().endsWith('.jsonl')) {
+                        return;
+                    }
+
+                    let deletedProjectPath = '';
+                    if (eventType === 'unlink') {
+                        deletedProjectPath = typeof getProviderSessionProjectPathForFile === 'function'
+                            ? await getProviderSessionProjectPathForFile(provider, filePath)
+                            : '';
+                    }
+                    const sessionChange = await resolveProviderSessionChange({
+                        provider,
+                        filePath,
+                        rootPath,
+                        changeType: eventType,
+                    });
+                    if (!sessionChange.projectPath && deletedProjectPath) {
+                        sessionChange.projectPath = deletedProjectPath;
+                    }
+                    try {
+                        if (eventType === 'unlink') {
+                            await deleteProviderSessionIndexFile(provider, filePath);
+                            const remainingSessions = deletedProjectPath && typeof countProviderSessionsForProject === 'function'
+                                ? await countProviderSessionsForProject(deletedProjectPath)
+                                : 0;
+                            if (deletedProjectPath && remainingSessions === 0 && typeof hideProviderProjectIndex === 'function') {
+                                hideProviderProjectIndex(deletedProjectPath, 'provider-session-deleted');
+                                void broadcastProjectListInvalidated({
+                                    reason: 'project-index-sync-delete',
+                                    changedProjectPath: deletedProjectPath,
+                                });
+                            }
+                        } else if (eventType === 'add' || eventType === 'change') {
+                            const session = await indexProviderSessionFile(provider, filePath);
+                            const projectPath = await upsertProjectIndexFromProviderSession(session);
+                            if (projectPath) {
+                                await syncWorkflowIndexForNewProviderSession({
+                                    eventType,
+                                    projectName: session?.projectName || '',
+                                    projectPath,
+                                    syncProjectWorkflowOverviewIndex,
+                                    ensureGoRunnerWatchersForProjects,
+                                    watchGoWorkflowRun,
+                                });
+                                void broadcastProjectListInvalidated({
+                                    reason: 'project-index-sync',
+                                    changedProjectPath: projectPath,
+                                });
+                            }
+                        }
+                    } catch (indexError: any) {
+                        console.warn('[WARN] Provider session index sync failed:', indexError?.message || indexError);
+                    }
+                    // Notify only after the indexing transaction commits, avoiding refreshes before SQLite writes.
+                    broadcastSessionChanged(sessionChange);
+                    // Emit scoped events only; transcript appends must not refresh the global project list.
+
+                } catch (error: any) {
+                    console.error('[ERROR] Error handling project changes:', error);
+                }
+            }, WATCHER_DEBOUNCE_MS);
+            projectsWatcherDebounceTimers.set(debounceKey, timer);
+        };
+
+        for (const { provider, rootPath } of PROVIDER_WATCH_PATHS) {
+            try {
+                // chokidar v4 emits ENOENT via the "error" event for missing roots and will not auto-recover.
+                // Ensure provider folders exist before creating the watcher so watching stays active.
+                await fsPromises.mkdir(rootPath, { recursive: true });
+
+                // Initialize chokidar watcher. Default is native inotify
+                // (event-driven, ~0 idle CPU); createProviderRootWatcher handles
+                // the per-root inotify→polling fallback if a host pool is
+                // genuinely exhausted. Polling can be forced per deployment via
+                // AGENTPORCH_PROVIDER_WATCH_USE_POLLING for non-inotify filesystems.
+                const { watcher } = await createProviderRootWatcher(rootPath, provider);
+
+                const readyPromise = new Promise<void>((resolve) => {
+                    const readyTimer = setTimeout(resolve, 1000);
+                    watcher.once('ready', () => {
+                        clearTimeout(readyTimer);
+                        resolve();
+                    });
+                });
+
+                // Set up event listeners
+                watcher
+                    .on('add', (filePath) => debouncedUpdate('add', filePath, provider, rootPath))
+                    .on('change', (filePath) => debouncedUpdate('change', filePath, provider, rootPath))
+                    .on('unlink', (filePath) => debouncedUpdate('unlink', filePath, provider, rootPath))
+                    .on('addDir', (dirPath) => debouncedUpdate('addDir', dirPath, provider, rootPath))
+                    .on('unlinkDir', (dirPath) => debouncedUpdate('unlinkDir', dirPath, provider, rootPath))
+                    .on('error', (error) => {
+                        console.error(`[ERROR] ${provider} watcher error:`, error);
+                    })
+                    .on('ready', () => {});
+
+                projectsWatchers.push(watcher);
+                readyPromises.push(readyPromise);
+            } catch (error: any) {
+                console.error(`[ERROR] Failed to setup ${provider} watcher for ${rootPath}:`, error);
+            }
+        }
+
+        if (projectsWatchers.length === 0) {
+            console.error('[ERROR] Failed to setup any provider watchers');
+        }
+
+        await Promise.all(readyPromises);
+    }
+
+
+
+    return {
+        closeProjectsWatchers,
+        closeGoRunnerWatchers,
+        setupProjectsWatcher,
+        setupGoRunnerWatchers,
+        watchGoWorkflowRun,
+    };
+}

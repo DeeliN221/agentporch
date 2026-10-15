@@ -1,0 +1,904 @@
+/**
+ * Coordinate workspace views, file sidebar, editor, and terminal layout.
+ * Switch each view independently without sidebar actions taking over the active main view.
+ */
+import React, { useEffect } from 'react';
+const Plus = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>;
+const Trash2 = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><polyline points="3,6 5,6 21,6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>;
+import FileTree from '../../file-tree/view/FileTree';
+import { FileTreeDockViewModeControls } from '../../file-tree/view/FileTreeViewModeControls';
+import ErrorBoundary from '../../ui/ErrorBoundary';
+import SessionAttentionBoard from '../../session-attention/SessionAttentionBoard';
+
+import MainContentHeader from './subcomponents/MainContentHeader';
+import MainContentStateView from './subcomponents/MainContentStateView';
+import ProjectOverviewPanel from './subcomponents/ProjectOverviewPanel';
+import WorkspaceDockLayout from './subcomponents/WorkspaceDockLayout';
+import type { MainContentProps } from '../types/types';
+import { useWorkspaceLayoutState } from '../hooks/useWorkspaceLayoutState';
+
+import { useUiPreferences } from '../../../hooks/useUiPreferences';
+import { useEditorSidebar } from '../../code-editor/hooks/useEditorSidebar';
+import type { EditorSidebarProps } from '../../code-editor/view/EditorSidebar';
+import type { StandaloneShellProps } from '../../standalone-shell/view/StandaloneShell';
+import type { AppTab, Project, ProjectSession } from '../../../types/app';
+import { getAllSessions } from '../../sidebar/utils/utils';
+
+const ChatInterface = React.lazy(() => import('../../chat/view/ChatInterface'));
+const LazyEditorSidebar = React.lazy(() => import('../../code-editor/view/EditorSidebar'));
+const LazyStandaloneShell = React.lazy(() => import('../../standalone-shell/view/StandaloneShell'));
+const WorkflowDetailView = React.lazy(() => import('./subcomponents/WorkflowDetailView'));
+
+function DeferredPanelFallback({ label }: { label: string }) {
+  /** Preserve the workspace panel geometry while a feature bundle downloads. */
+  return (
+    <div className="flex h-full min-h-24 w-full items-center justify-center bg-background text-sm text-muted-foreground" role="status">
+      <span className="animate-pulse">{label}</span>
+    </div>
+  );
+}
+
+function EditorSidebar(props: EditorSidebarProps) {
+  /** Load the editor only after a file has been selected. */
+  if (!props.editingFile) return null;
+  return (
+    <ErrorBoundary showDetails>
+      <React.Suspense fallback={<DeferredPanelFallback label="Loading editor…" />}>
+        <LazyEditorSidebar {...props} />
+      </React.Suspense>
+    </ErrorBoundary>
+  );
+}
+
+function StandaloneShell(props: StandaloneShellProps) {
+  /** Keep terminal-sized layout and error handling stable during lazy loading. */
+  return (
+    <ErrorBoundary showDetails>
+      <React.Suspense fallback={<DeferredPanelFallback label="Loading terminal…" />}>
+        <LazyStandaloneShell {...props} />
+      </React.Suspense>
+    </ErrorBoundary>
+  );
+}
+
+type TerminalInstance = {
+  id: string;
+  title: string;
+};
+
+const createTerminalInstance = (index: number): TerminalInstance => {
+  /**
+   * Create a local terminal tab descriptor. The shell connection lifecycle is
+   * owned by the mounted StandaloneShell for this id.
+   */
+  return {
+    id: `terminal-${Date.now()}-${index}`,
+    title: `Terminal ${index}`,
+  };
+};
+
+function MainContent({
+  selectedProject,
+  selectedSession,
+  selectedWorkflow,
+  activeTab,
+  setActiveTab,
+  ws,
+  sendMessage,
+  latestMessage,
+  messageHistory,
+  isMobile,
+  isSidebarOpen,
+  onMenuClick,
+  isLoading,
+  onInputFocusChange,
+  onSessionActive,
+  onSessionInactive,
+  onReplaceTemporarySession,
+  onNavigateToSession,
+  onSelectProjectOverview,
+  onSelectSession,
+  onSelectWorkflow,
+  onNewSession,
+  onShowSettings,
+  onRefresh,
+  externalMessageUpdate,
+  renderSnapshotRequestId,
+  onRenderSnapshotRequest,
+  onResolveFocusedSession,
+  headerLeadingContent,
+}: MainContentProps) {
+  /** activeTab owns the main view; desktop sidebars update only their own layout state. */
+  const { preferences } = useUiPreferences();
+  const { autoExpandTools, showRawParameters, showThinking, autoScrollToBottom } = preferences;
+  const [isRenderingSnapshot, setIsRenderingSnapshot] = React.useState(false);
+  const [isResolvingFocus, setIsResolvingFocus] = React.useState(false);
+  const [renderTargetError, setRenderTargetError] = React.useState('');
+  const renderRequestRef = React.useRef(0);
+  const renderScopeRef = React.useRef('');
+  renderScopeRef.current = `${selectedProject?.fullPath}:${selectedSession?.id}:${activeTab}`;
+  const readOnlyProviderCollection = selectedProject?.readOnlyProviderCollection === true;
+  const terminalScope = `${selectedProject?.fullPath || selectedProject?.path}:${selectedSession?.__provider}:${selectedSession?.id}:${selectedWorkflow?.id}`;
+  const [openedTerminalScope, setOpenedTerminalScope] = React.useState<string | null>(null);
+  if (activeTab === 'shell' && selectedProject && openedTerminalScope !== terminalScope) {
+    setOpenedTerminalScope(terminalScope);
+  }
+  const terminalClientRef = React.useRef<{ scope: string; pid: number | null } | null>(null);
+  const handleTerminalClientReady = React.useCallback((pid: number | null) => {
+    terminalClientRef.current = { scope: terminalScope, pid };
+  }, [terminalScope]);
+  const [renderSelection, setRenderSelection] = React.useState<{ scope: string; session: ProjectSession } | null>(null);
+  const transcriptSession = renderSelection?.scope === terminalScope ? renderSelection.session : selectedSession;
+
+  const projectSessions = selectedProject ? getAllSessions(selectedProject, {}, true) : [];
+  const [revealDirectoryRequest, setRevealDirectoryRequest] = React.useState<{ path: string; requestId: number } | null>(null);
+  const terminalCounterRef = React.useRef(1);
+  const terminalTerminateHandlersRef = React.useRef(new Map<string, () => boolean>());
+  const [terminalInstances, setTerminalInstances] = React.useState<TerminalInstance[]>(() => [createTerminalInstance(1)]);
+  const [activeTerminalId, setActiveTerminalId] = React.useState<string>(() => terminalInstances[0]?.id || '');
+  const workflowSessionWorkflow = React.useMemo(() => {
+    if (selectedWorkflow) {
+      return selectedWorkflow;
+    }
+    if (!selectedProject || !selectedSession?.workflowId) {
+      return null;
+    }
+    return (selectedProject.workflows || []).find((workflow) => workflow.id === selectedSession.workflowId) || null;
+  }, [selectedProject, selectedSession?.workflowId, selectedWorkflow]);
+
+  const {
+    editingFile,
+    editorWidth,
+    editorExpanded,
+    hasManualWidth,
+    resizeHandleRef,
+    handleFileOpen,
+    handleCloseEditor,
+    handleToggleEditorExpand,
+    handleResizeStart,
+  } = useEditorSidebar({
+    selectedProject,
+    isMobile,
+  });
+
+  // Workspace layout state for dock-based layout
+  const {
+    layout,
+    setRightDock,
+    setLowerPanel,
+    toggleRightDockCollapse,
+    toggleLowerPanelCollapse,
+    setRightDockWidth,
+    setLowerPanelHeight,
+    toggleRightDockFullscreen,
+    toggleLowerPanelFullscreen,
+    moveTerminalToRightSplit,
+    moveTerminalToLower,
+    setRightDockSplitRatio,
+  } = useWorkspaceLayoutState(isMobile);
+
+  useEffect(() => {
+    /**
+     * Terminal instances are scoped to the selected project.
+     */
+    terminalCounterRef.current = 1;
+    const initialTerminal = createTerminalInstance(1);
+    setTerminalInstances([initialTerminal]);
+    setActiveTerminalId(initialTerminal.id);
+  }, [selectedProject?.fullPath, selectedProject?.path, selectedProject?.name]);
+
+  useEffect(() => {
+    /**
+     * Reset render progress when moving to a different session.
+     */
+    setIsRenderingSnapshot(false);
+  }, [selectedSession?.id]);
+
+  useEffect(() => {
+    /**
+     * Reset render progress when leaving the rendered transcript view.
+     */
+    if (activeTab !== 'chat') {
+      setIsRenderingSnapshot(false);
+    }
+  }, [activeTab]);
+
+  const handleCreateTerminal = React.useCallback(() => {
+    /**
+     * Add an independent terminal for the current project and make it active.
+     */
+    terminalCounterRef.current += 1;
+    const nextTerminal = createTerminalInstance(terminalCounterRef.current);
+    setTerminalInstances((prev) => [...prev, nextTerminal]);
+    setActiveTerminalId(nextTerminal.id);
+    setLowerPanel({ activePanel: 'terminal', collapsed: false });
+  }, [setLowerPanel]);
+
+  const handleDeleteActiveTerminal = React.useCallback(() => {
+    /**
+     * Terminal deletion explicitly terminates its tmux session before unmounting the local view.
+     */
+    terminalTerminateHandlersRef.current.get(activeTerminalId)?.();
+    terminalTerminateHandlersRef.current.delete(activeTerminalId);
+    setTerminalInstances((prev) => {
+      const activeIndex = prev.findIndex((terminal) => terminal.id === activeTerminalId);
+      if (activeIndex === -1) {
+        return prev;
+      }
+
+      const next = prev.filter((terminal) => terminal.id !== activeTerminalId);
+      const nextActive = next[Math.max(0, activeIndex - 1)] || next[0] || null;
+      setActiveTerminalId(nextActive?.id || '');
+      if (next.length === 0) {
+        setLowerPanel({ collapsed: true, fullscreen: false });
+        setRightDock({ split: null });
+      }
+      return next;
+    });
+  }, [activeTerminalId, setLowerPanel, setRightDock]);
+
+  const terminalDockActions = (
+    <>
+      <button
+        type="button"
+        className="inline-flex items-center justify-center rounded-md p-1 text-xs text-muted-foreground hover:bg-muted/70 hover:text-foreground"
+        onClick={handleCreateTerminal}
+        aria-label="New terminal"
+        title="New"
+      >
+        <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+      </button>
+      <button
+        type="button"
+        className="inline-flex items-center justify-center rounded-md p-1 text-xs text-muted-foreground hover:bg-muted/70 hover:text-foreground disabled:opacity-40"
+        onClick={handleDeleteActiveTerminal}
+        disabled={!activeTerminalId}
+        aria-label="Delete terminal"
+        title="Delete"
+      >
+        <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+      </button>
+    </>
+  );
+  const fileDockTitleActions = layout.rightDock.activePanel === 'files'
+    ? <FileTreeDockViewModeControls />
+    : undefined;
+
+  const renderTerminalDockContent = () => {
+    /**
+     * Keep inactive terminals mounted so switching does not drop their shell
+     * connection; deleting unmounts only the selected instance.
+     */
+    if (terminalInstances.length === 0) {
+      return (
+        <div className="flex h-full items-center justify-center text-sm text-muted-foreground" data-testid="terminal-empty-state">
+          <button
+            type="button"
+            className="rounded-md border border-border px-3 py-1.5 text-sm text-foreground hover:bg-muted/70"
+            onClick={handleCreateTerminal}
+          >
+            New terminal
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="flex flex-shrink-0 items-center gap-1 border-b border-border/60 px-2 py-1" data-testid="terminal-instance-tabs">
+          {terminalInstances.map((terminal) => (
+            <button
+              key={terminal.id}
+              type="button"
+              className={`rounded-md px-2 py-1 text-xs ${
+                terminal.id === activeTerminalId
+                  ? 'bg-muted text-foreground'
+                  : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
+              }`}
+              onClick={() => setActiveTerminalId(terminal.id)}
+              aria-pressed={terminal.id === activeTerminalId}
+            >
+              {terminal.title}
+            </button>
+          ))}
+        </div>
+        <div className="relative min-h-0 flex-1">
+          {terminalInstances.map((terminal) => (
+            <div
+              key={terminal.id}
+              className={`absolute inset-0 ${terminal.id === activeTerminalId ? 'block' : 'hidden'}`}
+              data-testid="terminal-instance"
+              data-terminal-active={terminal.id === activeTerminalId ? 'true' : 'false'}
+            >
+              <StandaloneShell
+                project={selectedProject}
+                command={null}
+                isPlainShell
+                showHeader={false}
+                minimal
+                onTerminalTerminateReady={(terminate) => {
+                  if (terminate) {
+                    terminalTerminateHandlersRef.current.set(terminal.id, terminate);
+                    return;
+                  }
+
+                  terminalTerminateHandlersRef.current.delete(terminal.id);
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  // Wrap setActiveTab to handle dock toggle on user clicks without useEffect loops
+  const handleSetActiveTab = React.useCallback(
+    async (value: React.SetStateAction<AppTab>) => {
+      /** Read live terminal focus before selecting or refreshing rendered history. */
+      const nextTab = typeof value === 'function' ? value(activeTab) : value;
+      const requestId = ++renderRequestRef.current;
+      setRenderTargetError('');
+      if (readOnlyProviderCollection && nextTab !== 'overview' && nextTab !== 'chat') return;
+
+      if (nextTab === 'chat' && selectedProject && onResolveFocusedSession && openedTerminalScope === terminalScope) {
+        const scope = renderScopeRef.current;
+        setIsResolvingFocus(true);
+        try {
+          const client = terminalClientRef.current;
+          if (client?.scope !== terminalScope || !client.pid) throw new Error('Terminal is reconnecting. Try Render again once it is connected.');
+          const resolved = await onResolveFocusedSession(client.pid);
+          if (requestId !== renderRequestRef.current || scope !== renderScopeRef.current) return;
+          if (!resolved) throw new Error('No renderable session was found in the active pane.');
+          setRenderSelection({ scope: terminalScope, session: resolved });
+          setActiveTab('chat');
+          onRenderSnapshotRequest?.();
+          return;
+        } catch (error) {
+          if (requestId === renderRequestRef.current && scope === renderScopeRef.current) {
+            setRenderTargetError(error instanceof Error ? error.message : 'Unable to detect the current terminal session. Try again.');
+          }
+          return;
+        } finally {
+          if (requestId === renderRequestRef.current) setIsResolvingFocus(false);
+        }
+      } else {
+        setIsResolvingFocus(false);
+      }
+
+      if (nextTab === 'overview') {
+        if (selectedProject && (selectedSession || selectedWorkflow)) {
+          onSelectProjectOverview(selectedProject);
+        } else {
+          setActiveTab('overview');
+        }
+        return;
+      }
+
+      if (nextTab === 'chat' && selectedProject && !selectedSession && !selectedWorkflow) {
+        const targetSession = projectSessions[0] || null;
+        if (targetSession) {
+          setActiveTab('chat');
+          onSelectSession(targetSession);
+          onRenderSnapshotRequest?.();
+        } else {
+          setActiveTab('chat');
+        }
+        return;
+      }
+
+      if (nextTab === 'chat' && selectedSession) {
+        setActiveTab('chat');
+        onRenderSnapshotRequest?.();
+        return;
+      }
+
+      if (isMobile) {
+        setActiveTab(nextTab);
+        return;
+      }
+
+      if (nextTab === 'files') {
+        if (layout.rightDock.activePanel === 'files' && !layout.rightDock.collapsed) {
+          setRightDock({ collapsed: true, fullscreen: false });
+        } else {
+          setRightDock({ activePanel: 'files', collapsed: false, fullscreen: false });
+        }
+        return;
+      } else if (nextTab === 'shell') {
+        setActiveTab('shell');
+        return;
+      }
+
+      setActiveTab(nextTab);
+    },
+    [activeTab, openedTerminalScope, terminalScope, isMobile, layout.rightDock.activePanel, layout.rightDock.collapsed, layout.lowerPanel.activePanel, layout.lowerPanel.collapsed, onRenderSnapshotRequest, onResolveFocusedSession, onSelectProjectOverview, onSelectSession, projectSessions, readOnlyProviderCollection, selectedProject, selectedSession, selectedWorkflow, setRightDock, setLowerPanel, setActiveTab],
+  );
+
+  const openFilesDock = React.useCallback((directoryPath?: string) => {
+    /**
+     * Open the file browser from artifact links without changing desktop main
+     * content away from chat/workflow. Mobile keeps the single-view files tab.
+     */
+    if (readOnlyProviderCollection) return;
+    if (isMobile) {
+      setActiveTab('files');
+    } else {
+      setRightDock({ activePanel: 'files', collapsed: false, fullscreen: false });
+      setActiveTab('chat');
+    }
+
+    if (directoryPath) {
+      setRevealDirectoryRequest({ path: directoryPath, requestId: Date.now() });
+    }
+  }, [isMobile, readOnlyProviderCollection, setActiveTab, setRightDock]);
+
+  const handleOpenSessionTerminal = React.useCallback((session: ProjectSession) => {
+    /**
+     * Keep the browser route on the stable cN session URL while the UI opens
+     * the terminal view for that selected session.
+     */
+    setActiveTab('chat');
+    onSelectSession(session);
+  }, [onSelectSession, setActiveTab]);
+
+  const renderHeader = (headerActiveTab: AppTab = activeTab) => (
+    <MainContentHeader
+      activeTab={headerActiveTab}
+      setActiveTab={handleSetActiveTab}
+      selectedProject={selectedProject}
+      selectedSession={activeTab === 'chat' ? transcriptSession : selectedSession}
+      selectedWorkflow={selectedWorkflow}
+      isMobile={isMobile}
+      isSidebarOpen={isSidebarOpen}
+      onMenuClick={onMenuClick}
+      leadingContent={headerLeadingContent}
+      onRefresh={onRefresh}
+      isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
+        renderTargetError={renderTargetError}
+      readOnlyProviderCollection={readOnlyProviderCollection}
+      dockLayout={isMobile ? undefined : {
+        rightDockActive: layout.rightDock.activePanel,
+        rightDockCollapsed: layout.rightDock.collapsed,
+        lowerPanelActive: layout.lowerPanel.activePanel,
+        lowerPanelCollapsed: layout.lowerPanel.collapsed,
+        rightDockSplitBottom: layout.rightDock.split?.bottomPanel ?? null,
+      }}
+    />
+  );
+
+  const renderMobileEditor = () => (
+    <EditorSidebar
+      editingFile={editingFile}
+      isMobile={isMobile}
+      editorExpanded={editorExpanded}
+      editorWidth={editorWidth}
+      hasManualWidth={hasManualWidth}
+      resizeHandleRef={resizeHandleRef}
+      onResizeStart={handleResizeStart}
+      onCloseEditor={handleCloseEditor}
+      onToggleEditorExpand={handleToggleEditorExpand}
+      projectPath={selectedProject?.fullPath || selectedProject?.path}
+    />
+  );
+
+  const renderMobileWorkspace = (chatContent: React.ReactNode) => {
+    /**
+     * Render the mobile workspace as one full-screen task view selected by activeTab.
+     */
+    if (!selectedProject) {
+      return chatContent;
+    }
+
+    if (activeTab === 'files') {
+      return editingFile ? renderMobileEditor() : (
+        <FileTree
+          selectedProject={selectedProject}
+          onFileOpen={handleFileOpen}
+          revealDirectoryRequest={revealDirectoryRequest}
+          showHeaderTitle
+        />
+      );
+    }
+
+
+    return chatContent;
+  };
+
+  const renderMobileShell = (chatContent: React.ReactNode) => (
+    <div className="flex h-full max-h-[100dvh] min-h-0 flex-col overflow-hidden">
+      {renderHeader()}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid={`mobile-workspace-${activeTab}`}>
+        {renderMobileWorkspace(chatContent)}
+      </div>
+    </div>
+  );
+
+  const renderChatContent = () => (
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
+            <ErrorBoundary showDetails>
+              <React.Suspense fallback={<DeferredPanelFallback label="Loading chat…" />}>
+                <ChatInterface
+                  key={`chat-${transcriptSession?.id || 'project'}-${transcriptSession?.__provider || 'codex'}`}
+                  selectedProject={selectedProject}
+                  selectedSession={transcriptSession}
+                  ws={ws}
+                  sendMessage={sendMessage}
+                  latestMessage={latestMessage}
+                  messageHistory={messageHistory}
+                  onFileOpen={handleFileOpen}
+                  onInputFocusChange={onInputFocusChange}
+                  onSessionActive={onSessionActive}
+                  onSessionInactive={onSessionInactive}
+                  onReplaceTemporarySession={onReplaceTemporarySession}
+                  onNavigateToSession={onNavigateToSession}
+                  onNewSession={onNewSession}
+                  onShowSettings={onShowSettings}
+                  autoExpandTools={autoExpandTools}
+                  showRawParameters={showRawParameters}
+                  showThinking={showThinking}
+                  autoScrollToBottom={autoScrollToBottom}
+                  externalMessageUpdate={externalMessageUpdate}
+                  renderSnapshotRequestId={renderSnapshotRequestId}
+                  renderTranscriptOnMount={activeTab === 'chat'}
+                  onRenderSnapshotLoadingChange={setIsRenderingSnapshot}
+                />
+              </React.Suspense>
+            </ErrorBoundary>
+          </div>
+  );
+
+  // Keep the same terminal subtree and PTY connection while only the transcript changes.
+  const renderCenterViews = (content: React.ReactNode) => (
+    <>
+      <div key="terminal" data-testid="persistent-main-terminal" className={`flex-1 min-h-0 w-full ${activeTab === 'shell' ? 'flex' : 'hidden'}`}>
+        {openedTerminalScope === terminalScope && !readOnlyProviderCollection && (
+          <StandaloneShell
+            key={terminalScope}
+            project={selectedProject}
+            session={selectedSession}
+            command={null}
+            isPlainShell={!selectedSession}
+            showHeader={false}
+            minimal
+            onTerminalClientReady={handleTerminalClientReady}
+          />
+        )}
+      </div>
+      <div key="content" className={`flex-1 min-h-0 min-w-0 flex-col ${activeTab === 'shell' ? 'hidden' : 'flex'}`}>
+        {activeTab !== 'shell' && content}
+      </div>
+    </>
+  );
+
+  if (isLoading) {
+    return <MainContentStateView mode="loading" isMobile={isMobile} isSidebarOpen={isSidebarOpen} onMenuClick={onMenuClick} />;
+  }
+
+  if (!selectedProject) {
+    return (
+      <div className="h-full flex flex-col">
+        <MainContentHeader
+          activeTab={activeTab}
+          setActiveTab={handleSetActiveTab}
+          selectedProject={selectedProject}
+          selectedSession={activeTab === 'chat' ? transcriptSession : selectedSession}
+          selectedWorkflow={selectedWorkflow}
+          isMobile={isMobile}
+          isSidebarOpen={isSidebarOpen}
+          onMenuClick={onMenuClick}
+          leadingContent={headerLeadingContent}
+          onRefresh={onRefresh}
+          isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
+        renderTargetError={renderTargetError}
+          dockLayout={{
+            rightDockActive: layout.rightDock.activePanel,
+            rightDockCollapsed: layout.rightDock.collapsed,
+            lowerPanelActive: layout.lowerPanel.activePanel,
+            lowerPanelCollapsed: layout.lowerPanel.collapsed,
+            rightDockSplitBottom: layout.rightDock.split?.bottomPanel ?? null,
+          }}
+        />
+
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <SessionAttentionBoard onNavigateToSession={onNavigateToSession} />
+        </div>
+      </div>
+    );
+  }
+
+  if (selectedWorkflow && !selectedSession) {
+    // Workflow detail page with dock layout
+    const workflowCenterContent = renderCenterViews(activeTab === 'chat' && transcriptSession ? renderChatContent() : (
+      <>
+        <div className={`flex flex-col min-h-0 min-w-0 overflow-hidden flex-1 ${editorExpanded ? 'hidden' : ''}`}>
+          <ErrorBoundary showDetails>
+            <React.Suspense fallback={<DeferredPanelFallback label="Loading workflow…" />}>
+              <WorkflowDetailView
+                project={selectedProject}
+                workflow={selectedWorkflow}
+                onNavigateToSession={onNavigateToSession}
+                onOpenArtifactFile={handleFileOpen}
+                onOpenArtifactDirectory={openFilesDock}
+              />
+            </React.Suspense>
+          </ErrorBoundary>
+        </div>
+        <EditorSidebar
+          editingFile={editingFile}
+          isMobile={isMobile}
+          editorExpanded={editorExpanded}
+          editorWidth={editorWidth}
+          hasManualWidth={hasManualWidth}
+          resizeHandleRef={resizeHandleRef}
+          onResizeStart={handleResizeStart}
+          onCloseEditor={handleCloseEditor}
+          onToggleEditorExpand={handleToggleEditorExpand}
+          projectPath={selectedProject.fullPath || selectedProject.path}
+        />
+      </>
+    ));
+
+    if (isMobile) {
+      return renderMobileShell(workflowCenterContent);
+    }
+
+    const workflowRightDockContent = layout.rightDock.activePanel === 'files' ? (
+      <FileTree
+        selectedProject={selectedProject}
+        onFileOpen={handleFileOpen}
+        revealDirectoryRequest={revealDirectoryRequest}
+        showViewControls={false}
+      />
+    ) : null;
+
+    const workflowLowerPanelContent = layout.lowerPanel.activePanel === 'terminal' || layout.rightDock.split?.bottomPanel === 'terminal' ? (
+      renderTerminalDockContent()
+    ) : null;
+
+    return (
+      <div className="h-full flex flex-col">
+        <MainContentHeader
+          activeTab={activeTab}
+          setActiveTab={handleSetActiveTab}
+          selectedProject={selectedProject}
+          selectedSession={activeTab === 'chat' ? transcriptSession : selectedSession}
+          selectedWorkflow={selectedWorkflow}
+          isMobile={isMobile}
+          isSidebarOpen={isSidebarOpen}
+          onMenuClick={onMenuClick}
+          leadingContent={headerLeadingContent}
+          onRefresh={onRefresh}
+          isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
+        renderTargetError={renderTargetError}
+          dockLayout={{
+            rightDockActive: layout.rightDock.activePanel,
+            rightDockCollapsed: layout.rightDock.collapsed,
+            lowerPanelActive: layout.lowerPanel.activePanel,
+            lowerPanelCollapsed: layout.lowerPanel.collapsed,
+            rightDockSplitBottom: layout.rightDock.split?.bottomPanel ?? null,
+          }}
+        />
+        <div className="relative flex-1 flex min-h-0 overflow-hidden">
+          <WorkspaceDockLayout
+            layout={layout}
+            isMobile={isMobile}
+            centerContent={workflowCenterContent}
+            rightDockContent={workflowRightDockContent}
+            lowerPanelContent={workflowLowerPanelContent}
+            onRightDockWidthChange={setRightDockWidth}
+            onLowerPanelHeightChange={setLowerPanelHeight}
+            onRightDockCollapseToggle={toggleRightDockCollapse}
+            onLowerPanelCollapseToggle={toggleLowerPanelCollapse}
+            onRightDockFullscreenToggle={toggleRightDockFullscreen}
+            onLowerPanelFullscreenToggle={toggleLowerPanelFullscreen}
+            onMoveTerminalToRightSplit={moveTerminalToRightSplit}
+            onMoveTerminalToLower={moveTerminalToLower}
+            onRightDockSplitRatioChange={setRightDockSplitRatio}
+            rightDockTitleActions={fileDockTitleActions}
+            lowerPanelActions={terminalDockActions}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (
+    selectedProject
+    && !selectedSession
+    && !selectedWorkflow
+    && activeTab !== 'chat'
+  ) {
+    // Project overview page with dock layout for files/shell access
+    const overviewCenterContent = renderCenterViews(
+      <>
+        <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          <ProjectOverviewPanel
+            project={selectedProject}
+            selectedSession={selectedSession}
+            selectedWorkflow={selectedWorkflow}
+            sessions={getAllSessions(selectedProject, {}, true)}
+            displayMode={readOnlyProviderCollection ? 'sessions' : 'all'}
+            onNewSession={onNewSession}
+            onSelectSession={onSelectSession}
+            onOpenSessionTerminal={handleOpenSessionTerminal}
+            onSelectWorkflow={onSelectWorkflow}
+          />
+        </div>
+        {!readOnlyProviderCollection && <EditorSidebar
+          editingFile={editingFile}
+          isMobile={isMobile}
+          editorExpanded={editorExpanded}
+          editorWidth={editorWidth}
+          hasManualWidth={hasManualWidth}
+          resizeHandleRef={resizeHandleRef}
+          onResizeStart={handleResizeStart}
+          onCloseEditor={handleCloseEditor}
+          onToggleEditorExpand={handleToggleEditorExpand}
+          projectPath={selectedProject.path}
+          fillSpace={layout.rightDock.activePanel === 'files'}
+        />}
+      </>
+    );
+
+    if (isMobile) {
+      return renderMobileShell(overviewCenterContent);
+    }
+
+    const overviewRightDockContent = !readOnlyProviderCollection && layout.rightDock.activePanel === 'files' ? (
+      <FileTree
+        selectedProject={selectedProject}
+        onFileOpen={handleFileOpen}
+        revealDirectoryRequest={revealDirectoryRequest}
+        showViewControls={false}
+      />
+    ) : null;
+
+    const overviewLowerPanelContent = !readOnlyProviderCollection && (layout.lowerPanel.activePanel === 'terminal' || layout.rightDock.split?.bottomPanel === 'terminal') ? (
+      renderTerminalDockContent()
+    ) : null;
+
+    return (
+      <div className="h-full flex flex-col">
+        <MainContentHeader
+          activeTab={activeTab}
+          setActiveTab={handleSetActiveTab}
+          selectedProject={selectedProject}
+          selectedSession={selectedSession}
+          selectedWorkflow={selectedWorkflow}
+          isMobile={isMobile}
+          isSidebarOpen={isSidebarOpen}
+          onMenuClick={onMenuClick}
+          leadingContent={headerLeadingContent}
+          onRefresh={onRefresh}
+          isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
+        renderTargetError={renderTargetError}
+          readOnlyProviderCollection={readOnlyProviderCollection}
+          dockLayout={{
+            rightDockActive: layout.rightDock.activePanel,
+            rightDockCollapsed: layout.rightDock.collapsed,
+            lowerPanelActive: layout.lowerPanel.activePanel,
+            lowerPanelCollapsed: layout.lowerPanel.collapsed,
+            rightDockSplitBottom: layout.rightDock.split?.bottomPanel ?? null,
+          }}
+        />
+        <div className="relative flex-1 flex min-h-0 overflow-hidden">
+          <WorkspaceDockLayout
+            layout={layout}
+            isMobile={isMobile}
+            centerContent={overviewCenterContent}
+            rightDockContent={overviewRightDockContent}
+            lowerPanelContent={overviewLowerPanelContent}
+            onRightDockWidthChange={setRightDockWidth}
+            onLowerPanelHeightChange={setLowerPanelHeight}
+            onRightDockCollapseToggle={toggleRightDockCollapse}
+            onLowerPanelCollapseToggle={toggleLowerPanelCollapse}
+            onRightDockFullscreenToggle={toggleRightDockFullscreen}
+            onLowerPanelFullscreenToggle={toggleLowerPanelFullscreen}
+            onMoveTerminalToRightSplit={moveTerminalToRightSplit}
+            onMoveTerminalToLower={moveTerminalToLower}
+            onRightDockSplitRatioChange={setRightDockSplitRatio}
+            rightDockTitleActions={fileDockTitleActions}
+            lowerPanelActions={terminalDockActions}
+          />
+
+        </div>
+      </div>
+    );
+  }
+
+  // Main workspace with dock layout
+  const centerContent = renderCenterViews(
+    <>
+      <div className={`flex flex-col min-h-0 min-w-0 overflow-hidden ${editorExpanded ? 'hidden' : ''} flex-1`}>
+        {renderChatContent()}
+
+        <div className={`h-full overflow-hidden ${activeTab === 'preview' ? 'block' : 'hidden'}`} />
+      </div>
+
+      {!readOnlyProviderCollection && <EditorSidebar
+        editingFile={editingFile}
+        isMobile={isMobile}
+        editorExpanded={editorExpanded}
+        editorWidth={editorWidth}
+        hasManualWidth={hasManualWidth}
+        resizeHandleRef={resizeHandleRef}
+        onResizeStart={handleResizeStart}
+        onCloseEditor={handleCloseEditor}
+        onToggleEditorExpand={handleToggleEditorExpand}
+        projectPath={selectedProject.path}
+        fillSpace={layout.rightDock.activePanel === 'files'}
+      />}
+    </>
+  );
+
+  const rightDockContent = !readOnlyProviderCollection && layout.rightDock.activePanel === 'files' ? (
+    <FileTree
+      selectedProject={selectedProject}
+      onFileOpen={handleFileOpen}
+      revealDirectoryRequest={revealDirectoryRequest}
+      showViewControls={false}
+    />
+  ) : null;
+
+  const lowerPanelContent = !readOnlyProviderCollection && layout.lowerPanel.activePanel === 'terminal' ? (
+    renderTerminalDockContent()
+  ) : layout.rightDock.split?.bottomPanel === 'terminal' ? (
+    renderTerminalDockContent()
+  ) : null;
+
+  if (isMobile) {
+    return renderMobileShell(centerContent);
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      <MainContentHeader
+        activeTab={activeTab}
+        setActiveTab={handleSetActiveTab}
+        selectedProject={selectedProject}
+        selectedSession={activeTab === 'chat' ? transcriptSession : selectedSession}
+        selectedWorkflow={selectedWorkflow}
+        isMobile={isMobile}
+        isSidebarOpen={isSidebarOpen}
+        onMenuClick={onMenuClick}
+        leadingContent={headerLeadingContent}
+        onRefresh={onRefresh}
+        isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
+        renderTargetError={renderTargetError}
+        readOnlyProviderCollection={readOnlyProviderCollection}
+        dockLayout={{
+          rightDockActive: layout.rightDock.activePanel,
+          rightDockCollapsed: layout.rightDock.collapsed,
+          lowerPanelActive: layout.lowerPanel.activePanel,
+          lowerPanelCollapsed: layout.lowerPanel.collapsed,
+          rightDockSplitBottom: layout.rightDock.split?.bottomPanel ?? null,
+        }}
+      />
+
+      <div className="relative flex-1 flex min-h-0 overflow-hidden">
+        <WorkspaceDockLayout
+          layout={layout}
+          isMobile={isMobile}
+          centerContent={centerContent}
+          rightDockContent={rightDockContent}
+          lowerPanelContent={lowerPanelContent}
+          onRightDockWidthChange={setRightDockWidth}
+          onLowerPanelHeightChange={setLowerPanelHeight}
+          onRightDockCollapseToggle={toggleRightDockCollapse}
+          onLowerPanelCollapseToggle={toggleLowerPanelCollapse}
+          onRightDockFullscreenToggle={toggleRightDockFullscreen}
+          onLowerPanelFullscreenToggle={toggleLowerPanelFullscreen}
+          onMoveTerminalToRightSplit={moveTerminalToRightSplit}
+          onMoveTerminalToLower={moveTerminalToLower}
+          onRightDockSplitRatioChange={setRightDockSplitRatio}
+          rightDockTitleActions={fileDockTitleActions}
+          lowerPanelActions={terminalDockActions}
+        />
+
+      </div>
+    </div>
+  );
+}
+
+export default React.memo(MainContent);
