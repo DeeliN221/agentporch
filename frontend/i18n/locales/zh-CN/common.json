@@ -211,5 +211,22 @@
       "updateAvailable": "有可用更新",
       "closeSidebar": "关闭侧边栏"
     }
+  },
+  "attention": {
+    "title": "待处理会话",
+    "hint": "打开会话查看详情，或向右滑动卡片标记为已处理",
+    "loading": "正在加载待处理会话…",
+    "empty": "暂无待处理会话",
+    "completeAll": "全部标记为已处理",
+    "retry": "重试",
+    "unknownProject": "未知项目",
+    "unknownTime": "时间未知",
+    "loadError": "无法加载待处理会话",
+    "completeError": "无法将会话标记为已处理",
+    "completeAllError": "无法将全部会话标记为已处理",
+    "release": "松开以标记为已处理",
+    "swipe": "右滑标记为已处理",
+    "lastActive": "最近活动：{{time}}",
+    "omitted": "已省略中间请求"
   }
 }

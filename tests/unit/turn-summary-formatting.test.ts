@@ -18,3 +18,14 @@ test('USD uses the original estimate, CNY uses the converted estimate', () => {
   expect(formatTokenCostCny(estimate!.cny)).toBe('¥0.04');
   expect(formatTokenCostUsd(1.25)).toBe('$1.25');
 });
+
+test('goal duration handles missing values and localizes every unit', async () => {
+  const { formatTaskDurationMs } = await import('../../frontend/components/chat/utils/turnSummaryFormatting');
+  for (const value of [undefined, null, '', -1, Number.NaN, Infinity]) {
+    expect(formatTaskDurationMs(value, 'zh-CN')).toBeNull();
+  }
+  expect(formatTaskDurationMs(0, 'zh-CN')).toBe('不足 1 秒');
+  expect(formatTaskDurationMs(83000, 'zh-CN')).toBe('01分 23秒');
+  expect(formatTaskDurationMs(3723000, 'zh-CN')).toBe('01小时 02分 03秒');
+  expect(formatTaskDurationMs(83000, 'en')).toBe('01m 23s');
+});

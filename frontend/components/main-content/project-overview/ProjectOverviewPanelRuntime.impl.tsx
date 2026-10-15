@@ -59,10 +59,10 @@ const normalizeActionSessionProvider = (provider: unknown): SessionProvider => (
 );
 
 const CARD_SORT_OPTIONS: Array<{ value: SessionCardSortMode; label: string }> = [
-  { value: 'created', label: 'Created' },
-  { value: 'updated', label: 'Latest message' },
-  { value: 'title', label: 'Title' },
-  { value: 'provider', label: 'Provider' },
+  { value: 'created', label: 'overview.created' },
+  { value: 'updated', label: 'overview.updated' },
+  { value: 'title', label: 'overview.title' },
+  { value: 'provider', label: 'overview.provider' },
 ];
 
 type StartableManualProvider = 'codex' | 'pi' | 'claude';
@@ -251,7 +251,7 @@ function BatchWorkflowGroup({
       >
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
           <span className="min-w-0 truncate font-medium text-foreground">
-            {isLatest ? 'Latest batch' : 'Earlier batch'}:{group.label.replace(/^批量任务\s*/, '')}
+            {isLatest ? t('overview.latestBatch') : t('overview.earlierBatch')}:{group.label.replace(/^批量任务\s*/, '')}
           </span>
           <span className="text-muted-foreground">·</span>
           <span className="shrink-0 text-muted-foreground">{progressLabel}</span>
@@ -359,10 +359,10 @@ function renderWorkflowCard(
         <div className="flex w-full min-w-0 items-center gap-2 overflow-hidden text-xs leading-none text-muted-foreground">
           <span className="shrink-0">
             {isPendingBatchItem
-              ? 'Not started'
+              ? t('overview.notStarted')
               : workflow.updatedAt
               ? formatTimeAgo(workflow.updatedAt, currentTime, t)
-              : 'Unknown time'}
+              : t('overview.unknownTime')}
           </span>
           <WorkflowStageProgress stageStatuses={workflow.stageStatuses} size="sm" />
         </div>
@@ -720,7 +720,7 @@ export default function ProjectOverviewPanel({
   ) => {
     if (!getProviderCapabilities(provider)?.deleteSession) return;
     closeActionMenu();
-    if (!window.confirm(`Delete “${sessionTitle}”? This cannot be undone.`)) {
+    if (!window.confirm(t('overview.deletePrompt', { title: sessionTitle }))) {
       return;
     }
 
@@ -747,7 +747,7 @@ export default function ProjectOverviewPanel({
       return;
     }
 
-    if (!window.confirm(`Delete ${selectedSessions.length} selected sessions? This cannot be undone.`)) {
+    if (!window.confirm(t('overview.deleteSelectedPrompt', { count: selectedSessions.length }))) {
       return;
     }
 
@@ -776,7 +776,7 @@ export default function ProjectOverviewPanel({
     currentTitle: string,
   ) => {
     if (!getProviderCapabilities(provider)?.renameSession) return;
-    const nextTitle = window.prompt('Enter a new session name', currentTitle);
+    const nextTitle = window.prompt(t('overview.renamePrompt'), currentTitle);
     if (nextTitle == null) {
       return;
     }
@@ -997,8 +997,8 @@ export default function ProjectOverviewPanel({
             >
               {workflowExpanded ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
               <div>
-                <h3 className="text-base font-semibold text-foreground">Automated workflows</h3>
-                <p className="text-sm text-muted-foreground">{workflows.length} active workflows</p>
+                <h3 className="text-base font-semibold text-foreground">{t('overview.workflows')}</h3>
+                <p className="text-sm text-muted-foreground">{t('overview.activeWorkflows', { count: workflows.length })}</p>
               </div>
             </button>
             <div className="flex flex-wrap items-center gap-2">
@@ -1006,10 +1006,10 @@ export default function ProjectOverviewPanel({
                 value={workflowSortMode}
                 onChange={(event) => setWorkflowSortMode(event.target.value as WorkflowCardSortMode)}
                 className="h-9 min-w-[9.5rem] rounded-md border border-input bg-transparent py-1 pl-3 pr-10 text-sm text-muted-foreground outline-none focus:ring-1 focus:ring-ring"
-                aria-label="Sort workflows"
+                aria-label={t('overview.sortWorkflows')}
               >
                 {CARD_SORT_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
+                  <option key={option.value} value={option.value}>{t(option.label)}</option>
                 ))}
               </select>
               {hiddenSessionCount > 0 && (
@@ -1020,11 +1020,11 @@ export default function ProjectOverviewPanel({
                   className="h-9"
                   onClick={() => setShowHiddenItems((current) => !current)}
                 >
-                  {showHiddenItems ? 'Collapse hidden items' : `Show hidden items (${hiddenSessionCount})`}
+                  {showHiddenItems ? t('overview.collapseHidden') : t('overview.showHidden', { count: hiddenSessionCount })}
                 </Button>
               )}
               <Button variant="outline" className="h-9 gap-2 self-start" onClick={() => setWorkflowActionDialogOpen(true)}>
-                Workflow actions
+                {t('overview.workflowActions')}
               </Button>
             </div>
           </div>
@@ -1042,7 +1042,7 @@ export default function ProjectOverviewPanel({
             <div className="mt-4 space-y-4">
               {batchGroups.length === 0 ? (
                 <div className="rounded-md border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">
-                  No automated workflows
+                  {t('overview.noWorkflows')}
                 </div>
               ) : (
                 <>
@@ -1068,7 +1068,7 @@ export default function ProjectOverviewPanel({
                       className="h-9 w-full border border-dashed border-border/70"
                       onClick={() => setShowAllWorkflowGroups(true)}
                     >
-                      View earlier workflow batches ({hiddenWorkflowGroupCount})
+                      {t('overview.earlierBatches', { count: hiddenWorkflowGroupCount })}
                     </Button>
                   )}
                 </>
@@ -1093,8 +1093,8 @@ export default function ProjectOverviewPanel({
             >
               {sessionExpanded ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
               <div>
-                <h3 className="text-base font-semibold text-foreground">{readOnlyProviderCollection ? 'Unassigned Hermes sessions' : 'Manual sessions'}</h3>
-                <p className="text-sm text-muted-foreground">{visibleSessions.length} available sessions</p>
+                <h3 className="text-base font-semibold text-foreground">{readOnlyProviderCollection ? t('overview.hermesSessions') : t('overview.manualSessions')}</h3>
+                <p className="text-sm text-muted-foreground">{t('overview.availableSessions', { count: visibleSessions.length })}</p>
               </div>
             </button>
             <div className="flex flex-col items-start gap-2">
@@ -1103,10 +1103,10 @@ export default function ProjectOverviewPanel({
                   value={sessionSortMode}
                   onChange={(event) => setSessionSortMode(event.target.value as SessionCardSortMode)}
                   className="h-9 min-w-[9.5rem] rounded-md border border-input bg-transparent py-1 pl-3 pr-10 text-sm text-muted-foreground outline-none focus:ring-1 focus:ring-ring"
-                  aria-label="Sort manual sessions"
+                  aria-label={t('overview.sortSessions')}
                 >
                   {CARD_SORT_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
+                    <option key={option.value} value={option.value}>{t(option.label)}</option>
                   ))}
                 </select>
                 {!readOnlyProviderCollection && <Button
@@ -1127,7 +1127,7 @@ export default function ProjectOverviewPanel({
                   data-testid="project-overview-session-selection-toggle"
                   onClick={isSessionSelectionMode ? exitSessionSelectionMode : enableSessionSelectionMode}
                 >
-                  {isSessionSelectionMode ? 'Exit selection' : 'Select'}
+                  {isSessionSelectionMode ? t('overview.exitSelection') : t('overview.select')}
                 </Button>}
               </div>
               {providerPickerOpen && (
@@ -1135,7 +1135,7 @@ export default function ProjectOverviewPanel({
                   data-testid="project-new-session-provider-picker"
                   className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-background px-3 py-2"
                 >
-                  <span className="text-xs text-muted-foreground">Choose a session provider</span>
+                  <span className="text-xs text-muted-foreground">{t('overview.chooseProvider')}</span>
                   {startableProviders.map((provider) => (
                     <Button key={provider} type="button" size="sm" variant="outline"
                       data-testid={`project-new-session-provider-${provider}`}
@@ -1145,7 +1145,7 @@ export default function ProjectOverviewPanel({
                   ))}
                   {runtimeCapabilities && startableProviders.length === 0 && (
                     <span data-testid="project-new-session-provider-missing" className="text-xs text-muted-foreground">
-                      No supported agent CLI was found. Install Codex, Pi, or Claude Code and refresh.
+                      {t('overview.noCli')}
                     </span>
                   )}
                   <Button
@@ -1154,7 +1154,7 @@ export default function ProjectOverviewPanel({
                     variant="ghost"
                     onClick={() => setProviderPickerOpen(false)}
                   >
-                    Cancel
+                    {t('overview.cancel')}
                   </Button>
                 </div>
               )}
@@ -1182,9 +1182,9 @@ export default function ProjectOverviewPanel({
                       checked={allVisibleSessionsSelected}
                       onChange={selectAllVisibleSessions}
                     />
-                    Select visible
+                    {t('overview.selectVisible')}
                   </label>
-                  <span className="text-muted-foreground">Selected {selectedSessions.length}</span>
+                  <span className="text-muted-foreground">{t('overview.selected', { count: selectedSessions.length })}</span>
                   {selectedSessions.length > 0 && (
                     <>
                       <Button
@@ -1197,7 +1197,7 @@ export default function ProjectOverviewPanel({
                           favorite: !allSelectedSessionsFavorite,
                         })}
                       >
-                        {allSelectedSessionsFavorite ? 'Unfavorite' : 'Favorite'}
+                        {allSelectedSessionsFavorite ? t('overview.unfavorite') : t('overview.favorite')}
                       </Button>
                       <Button
                         type="button"
@@ -1209,7 +1209,7 @@ export default function ProjectOverviewPanel({
                           pending: !allSelectedSessionsPending,
                         })}
                       >
-                        {allSelectedSessionsPending ? 'Clear pending' : 'Pending'}
+                        {allSelectedSessionsPending ? t('overview.unpending') : t('overview.pending')}
                       </Button>
                       <Button
                         type="button"
@@ -1221,7 +1221,7 @@ export default function ProjectOverviewPanel({
                           hidden: !allSelectedSessionsHidden,
                         })}
                       >
-                        {allSelectedSessionsHidden ? 'Unhide' : 'Hide'}
+                        {allSelectedSessionsHidden ? t('overview.unhide') : t('overview.hide')}
                       </Button>
                       <Button
                         type="button"
@@ -1231,7 +1231,7 @@ export default function ProjectOverviewPanel({
                         data-testid="project-overview-bulk-delete"
                         onClick={() => void handleBatchDeleteSessions()}
                       >
-                        Delete
+                        {t('overview.delete')}
                       </Button>
                       <Button
                         type="button"
@@ -1242,7 +1242,7 @@ export default function ProjectOverviewPanel({
                         onClick={exitSessionSelectionMode}
                       >
                         <X className="h-4 w-4" />
-                        Exit
+                        {t('overview.exit')}
                       </Button>
                     </>
                   )}
@@ -1325,13 +1325,13 @@ export default function ProjectOverviewPanel({
                           >
                             {sessionView.sessionTime
                               ? formatTimeAgo(sessionView.sessionTime, currentTime, t)
-                              : 'Unknown time'}
+                              : t('overview.unknownTime')}
                           </span>
                           <span className="flex min-w-0 flex-1 items-center gap-2">
                             {hasUnreadActivity && (
                               <span
                                 className="inline-flex h-2 w-2 shrink-0 rounded-full bg-yellow-400 shadow-sm"
-                                title="Unread messages"
+                                title={t('overview.unread')}
                               />
                             )}
                             <span
@@ -1346,7 +1346,7 @@ export default function ProjectOverviewPanel({
                             data-slot="manual-session-route-number"
                             className="shrink-0 text-sm font-medium text-foreground"
                           >
-                            {routeNumber ? `#${routeNumber}` : 'Unnumbered'}
+                            {routeNumber ? `#${routeNumber}` : t('overview.unnumbered')}
                           </span>
                         </button>
                     </div>
@@ -1361,7 +1361,7 @@ export default function ProjectOverviewPanel({
                   className="h-9 w-full border border-dashed border-border/70"
                   onClick={() => setShowAllManualSessionCards(true)}
                 >
-                  Show more manual sessions ({hiddenManualSessionCardCount})
+                  {t('overview.moreSessions', { count: hiddenManualSessionCardCount })}
                 </Button>
               )}
               {showAllManualSessionCards && visibleSessions.length > DEFAULT_VISIBLE_MANUAL_SESSION_CARDS && (
@@ -1371,7 +1371,7 @@ export default function ProjectOverviewPanel({
                   className="h-9 w-full border border-dashed border-border/70"
                   onClick={() => setShowAllManualSessionCards(false)}
                 >
-                  Collapse manual sessions
+                  {t('overview.collapseSessions')}
                 </Button>
               )}
             </div>
@@ -1388,14 +1388,14 @@ export default function ProjectOverviewPanel({
             isPending={activeSessionActionItem.pending === true}
             isHidden={activeSessionActionItem.hidden === true}
             labels={{
-              rename: 'Rename',
-              favorite: 'Favorite',
-              unfavorite: 'Unfavorite',
-              pending: 'Pending',
-              unpending: 'Clear pending',
-              hide: 'Hide',
-              unhide: 'Unhide',
-              delete: 'Delete',
+              rename: t('overview.rename'),
+              favorite: t('overview.favorite'),
+              unfavorite: t('overview.unfavorite'),
+              pending: t('overview.pending'),
+              unpending: t('overview.unpending'),
+              hide: t('overview.hide'),
+              unhide: t('overview.unhide'),
+              delete: t('overview.delete'),
             }}
             testIds={{
               rename: 'project-overview-context-rename',
@@ -1464,7 +1464,7 @@ export default function ProjectOverviewPanel({
               }}
             >
               <ChevronRight className="h-4 w-4" />
-              Open details
+              {t('overview.details')}
             </button>
           </div>
         )}
@@ -1472,7 +1472,7 @@ export default function ProjectOverviewPanel({
         <section className="mt-6 border-t border-dashed border-border/60 pt-6 text-sm text-muted-foreground">
           <div className="flex items-center gap-2">
             <FolderOpen className="h-4 w-4" />
-            Open a session or workflow from the list to continue.
+            {t('overview.continue')}
           </div>
         </section>
       </div>

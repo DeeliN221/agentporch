@@ -1,3 +1,4 @@
+import { formatTaskDurationMs } from '../../utils/turnSummaryFormatting';
 /**
  * PURPOSE: Render one chat transcript row, including user bubbles, assistant
  * text, thinking output, tool cards, and compact task notifications.
@@ -61,40 +62,11 @@ type InteractiveOption = {
 };
 
 /**
- * Format task runtime as a compact human-readable duration badge.
- */
-function formatTaskDurationMs(value: unknown): string | null {
-  const durationMs = Number(value);
-  if (!Number.isFinite(durationMs) || durationMs < 0) {
-    return null;
-  }
-
-  const totalSeconds = Math.round(durationMs / 1000);
-  if (totalSeconds <= 0) {
-    return '<1s';
-  }
-
-  if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
-  }
-
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes < 60) {
-    return `${minutes}m ${seconds}s`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  return `${hours}h ${remainingMinutes.toString().padStart(2, '0')}m`;
-}
-
-/**
  * Render a single chat transcript message using shared visual contracts for
  * provider-agnostic flags such as isThinking and isToolUse.
  */
 const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFileOpen, onShowSettings, autoExpandTools, showRawParameters, showThinking, suppressAssistantMetadata, selectedProject, provider }: MessageComponentProps) => {
-  const { t } = useTranslation('chat');
+  const { t, i18n } = useTranslation('chat');
   const messageAttachments = Array.isArray(message.attachments)
     ? message.attachments
     : (Array.isArray(message.images) ? message.images : []);
@@ -185,7 +157,7 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
       : t('messageTypes.assistant');
   const isCompletedTaskNotification = message.taskStatus === 'completed';
   const isGoalCompletionNotification = isCompletedTaskNotification && message.taskKind === 'goal_complete';
-  const completedTaskDuration = useMemo(() => formatTaskDurationMs(message.durationMs), [message.durationMs]);
+  const completedTaskDuration = formatTaskDurationMs(message.durationMs, i18n.resolvedLanguage || i18n.language);
   const selectedProjectRoot = selectedProject?.fullPath || selectedProject?.path || '';
   const hideAssistantMetadata = Boolean(suppressAssistantMetadata) || isCodexLiveAssistant(message) || (isToolCard && isLiveToolSource(message.source));
 
@@ -248,7 +220,7 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                 </span>
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm font-semibold text-emerald-950 dark:text-emerald-100">Goal completed</span>
+                    <span className="text-sm font-semibold text-emerald-950 dark:text-emerald-100">{t('turnSummary.goalCompleted')}</span>
                     {completedTaskDuration && (
                       <span className="rounded-full border border-emerald-200 bg-white/80 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:border-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-100">
                         {completedTaskDuration}

@@ -3,7 +3,8 @@
     "duration": "耗时 {{duration}}",
     "estimatedCost": "预估成本 {{cost}}",
     "costDisclaimer": "按 {{model}} 标准费率估算；1 美元 ≈ {{rate}} 元人民币；并非实际账单",
-    "toolCalls": "{{count}} 次工具调用"
+    "toolCalls": "{{count}} 次工具调用",
+    "goalCompleted": "目标已完成"
   },
   "codeBlock": {
     "copy": "复制",

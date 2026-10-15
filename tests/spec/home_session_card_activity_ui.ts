@@ -173,9 +173,9 @@ test('project-home cards expose business sort choices while sidebar stays naviga
     'utf8',
   );
 
-  assert.match(overviewSource, /value: 'updated', label: 'Latest message'/);
-  assert.match(overviewSource, /value: 'title', label: 'Title'/);
-  assert.match(overviewSource, /value: 'provider', label: 'Provider'/);
+  assert.match(overviewSource, /value: 'updated', label: 'overview.updated'/);
+  assert.match(overviewSource, /value: 'title', label: 'overview.title'/);
+  assert.match(overviewSource, /value: 'provider', label: 'overview.provider'/);
   assert.match(overviewSource, /compareSessionsByCardSortMode\(sessionA, sessionB, sessionSortMode, t\)/);
   assert.match(overviewSource, /min-w-\[9\.5rem\][^"]*pr-10/);
   assert.doesNotMatch(sidebarProjectItemSource, /aria-label="Sort manual sessions"/);
@@ -200,8 +200,8 @@ test('project-home manual sessions collapse after five rows and keep request-pre
 
   assert.match(overviewSource, /DEFAULT_VISIBLE_MANUAL_SESSION_CARDS = 5/);
   assert.match(overviewSource, /visibleSessions\.slice\(0, DEFAULT_VISIBLE_MANUAL_SESSION_CARDS\)/);
-  assert.match(overviewSource, /Show more manual sessions/);
-  assert.match(overviewSource, /Collapse manual sessions/);
+  assert.match(overviewSource, /overview\.moreSessions/);
+  assert.match(overviewSource, /overview\.collapseSessions/);
   assert.match(overviewSource, /getManualSessionCardTitle\(session, sessionView\.sessionName\)/);
   assert.match(overviewSource, /className="flex flex-col gap-2"/);
   assert.match(overviewSource, /aria-label=\{sessionCardTitle\}/);

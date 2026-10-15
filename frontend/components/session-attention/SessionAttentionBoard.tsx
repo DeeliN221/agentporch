@@ -3,6 +3,7 @@
  * Opening a session does not acknowledge it; only an explicit completion action removes the card.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { SessionProvider } from '../../types/app';
 import { api } from '../../utils/api';
 import SessionAttentionCard from './SessionAttentionCard';
@@ -31,7 +32,7 @@ type SessionAttentionBoardProps = {
  */
 function projectLabel(projectPath: string): string {
   /** Prefer recognizable directory names in the limited width of cross-project lists. */
-  return String(projectPath || '').split(/[\\/]/).filter(Boolean).at(-1) || 'Unknown project';
+  return String(projectPath || '').split(/[\\/]/).filter(Boolean).at(-1) || '';
 }
 
 /**
@@ -44,6 +45,7 @@ function attentionIdentity(item: Pick<AttentionItem, 'provider' | 'sessionId'>):
 
 export default function SessionAttentionBoard({ onNavigateToSession }: SessionAttentionBoardProps) {
   /** Fetch at most 100 items without polling an idle backend. */
+  const { t } = useTranslation('common');
   const [items, setItems] = useState<AttentionItem[]>([]);
   const [submittingIds, setSubmittingIds] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(true);
@@ -58,10 +60,10 @@ export default function SessionAttentionBoard({ onNavigateToSession }: SessionAt
       try {
         const response = await api.sessionAttention(100);
         const payload = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(payload?.error || 'Unable to load pending sessions');
+        if (!response.ok) throw new Error(payload?.error || 'attention.loadError');
         setItems(Array.isArray(payload?.items) ? payload.items : []);
       } catch (loadError) {
-        setError(loadError instanceof Error ? loadError.message : 'Unable to load pending sessions');
+        setError('attention.loadError');
       } finally {
         setIsLoading(false);
         loadPromiseRef.current = null;
@@ -88,12 +90,12 @@ export default function SessionAttentionBoard({ onNavigateToSession }: SessionAt
         observedRevision: item.activityRevision,
       })));
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload?.error || 'Unable to complete the session');
+      if (!response.ok) throw new Error(payload?.error || 'attention.completeError');
       await load();
       const newerActivity = new Set(Array.isArray(payload?.newerActivity) ? payload.newerActivity : []);
       return targets.every((item) => !newerActivity.has(attentionIdentity(item)));
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : 'Unable to complete the session');
+      setError('attention.completeError');
       return false;
     } finally {
       setSubmittingIds(new Set());
@@ -108,17 +110,17 @@ export default function SessionAttentionBoard({ onNavigateToSession }: SessionAt
     try {
       const response = await api.markAllSessionAttentionHandled();
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload?.error || 'Unable to complete all sessions');
+      if (!response.ok) throw new Error(payload?.error || 'attention.completeAllError');
       await load();
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : 'Unable to complete all sessions');
+      setError('attention.completeAllError');
     } finally {
       setSubmittingIds(new Set());
     }
   };
 
   if (isLoading) {
-    return <div data-testid="session-attention-board" className="flex h-full items-center justify-center text-sm text-muted-foreground">Loading pending sessions…</div>;
+    return <div data-testid="session-attention-board" className="flex h-full items-center justify-center text-sm text-muted-foreground">{t('attention.loading')}</div>;
   }
 
   return (
@@ -126,22 +128,22 @@ export default function SessionAttentionBoard({ onNavigateToSession }: SessionAt
       <div className="w-full">
         <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h1 className="text-xl font-semibold text-foreground">Pending sessions</h1>
-            <p className="mt-1 text-sm text-muted-foreground">Open a session, or swipe a card right to mark it complete</p>
+            <h1 className="text-xl font-semibold text-foreground">{t('attention.title')}</h1>
+            <p className="mt-1 text-sm text-muted-foreground">{t('attention.hint')}</p>
           </div>
           {items.length > 0 && (
-            <button type="button" disabled={submittingIds.size > 0} className="rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50" onClick={() => void markAllHandled()}>Mark all complete</button>
+            <button type="button" disabled={submittingIds.size > 0} className="rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50" onClick={() => void markAllHandled()}>{t('attention.completeAll')}</button>
           )}
         </div>
 
         {error && (
           <div role="alert" className="mb-4 flex items-center justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
-            <span>{error}</span><button type="button" className="underline" onClick={() => void load()}>Retry</button>
+            <span>{t(error)}</span><button type="button" className="underline" onClick={() => void load()}>{t('attention.retry')}</button>
           </div>
         )}
 
         {items.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">No pending sessions</div>
+          <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">{t('attention.empty')}</div>
         ) : (
           <div className="space-y-3 pb-4">
             {items.map((item) => (
@@ -149,7 +151,7 @@ export default function SessionAttentionBoard({ onNavigateToSession }: SessionAt
                 key={attentionIdentity(item)}
                 provider={item.provider}
                 sessionId={item.sessionId}
-                projectName={projectLabel(item.projectPath)}
+                projectName={projectLabel(item.projectPath) || t('attention.unknownProject')}
                 firstRequest={item.firstRequest || item.title || item.summary}
                 latestRequest={item.latestRequest || item.firstRequest || item.title || item.summary}
                 lastActivity={item.lastActivity}

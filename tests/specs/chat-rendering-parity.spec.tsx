@@ -13,6 +13,7 @@ import test, { after } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import i18next from 'i18next';
+import enChat from '../../frontend/i18n/locales/en/chat.json';
 import { I18nextProvider } from 'react-i18next';
 import { createServer, type ViteDevServer } from 'vite';
 import type { ChatMessage, Provider } from '../../frontend/components/chat/types/types.ts';
@@ -80,6 +81,7 @@ async function ensureI18n(): Promise<void> {
     resources: {
       en: {
         chat: {
+          ...enChat,
           messageTypes: {
             codex: 'Codex',
             pi: 'Pi',
@@ -700,14 +702,14 @@ test('pre-body process groups preserve completed duration and active timing anch
   const turnGroupSource = await readSource('frontend/components/chat/view/subcomponents/TurnNonBodyGroup.tsx');
 
   assert.equal(completedGroup?.processedDurationMs, 83_000);
-  assert.equal(formatProcessedDuration(48_000), '48秒');
-  assert.equal(formatProcessedDuration(completedGroup?.processedDurationMs || 0), '01分钟23秒');
-  assert.equal(formatProcessedDuration(3_723_000), '01时02分03秒');
+  assert.equal(formatProcessedDuration(48_000, 'zh-CN'), '48秒');
+  assert.equal(formatProcessedDuration(completedGroup?.processedDurationMs || 0, 'zh-CN'), '01分 23秒');
+  assert.equal(formatProcessedDuration(3_723_000, 'zh-CN'), '01小时 02分 03秒');
   assert.equal(completedGroup?.isProcessing, false);
   assert.equal(liveGroup?.processingStartedAt, '2026-06-10T12:00:00.000Z');
   assert.equal(liveGroup?.isProcessing, true);
   assert.match(turnGroupSource, /data-testid=["']turn-non-body-elapsed["']/);
-  assert.match(turnGroupSource, /耗时 \{processedDuration\}/);
+  assert.match(turnGroupSource, /t\('turnSummary\.duration'/);
   assert.match(turnGroupSource, /setInterval[\s\S]*1000/);
 });
 
@@ -752,7 +754,7 @@ test('pre-body process summary carries an OpenAI standard-price RMB estimate', a
   assert.deepEqual(group?.tokenUsage, messages[2].tokenUsage);
   assert.equal(formatTokenCostCny(estimate?.cny || 0), '¥0.04');
   assert.match(turnGroupSource, /data-testid=["']turn-non-body-cost["']/);
-  assert.match(turnGroupSource, /价值 \{tokenCostLabel\}/);
+  assert.match(turnGroupSource, /t\('turnSummary\.estimatedCost'/);
   assert.doesNotMatch(turnGroupSource, />正文前过程</);
 });
 
@@ -1121,8 +1123,8 @@ test('tool-only turn activity renders one collapsed tool group without row metad
   assert.match(turnGroupSource, /data-testid=["']turn-tool-list-group["']/);
   assert.match(turnGroupSource, /data-testid=["']turn-tool-list-toggle["']/);
   assert.match(turnGroupSource, /data-testid=["']turn-tool-list["']/);
-  assert.match(turnGroupSource, /一次工具调用/);
-  assert.match(turnGroupSource, /\$\{toolInvocationCount\}次工具调用/);
+  assert.match(turnGroupSource, /t\('turnSummary\.toolCalls'/);
+  assert.match(turnGroupSource, /count: toolInvocationCount/);
   assert.match(turnGroupSource, /suppressAssistantMetadata:\s*true/);
   assert.match(messageSource, /suppressAssistantMetadata/);
   assert.match(messageSource, /Boolean\(suppressAssistantMetadata\)/);

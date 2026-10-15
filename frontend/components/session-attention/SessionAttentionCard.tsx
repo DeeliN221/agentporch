@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 /**
  * Render a horizontally draggable pending-session card.
  * Support swipe-to-complete on mobile and desktop while retaining click and keyboard access.
@@ -67,12 +68,13 @@ export default function SessionAttentionCard({
   const [dragX, setDragX] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [isExiting, setIsExiting] = useState(false);
+  const { t } = useTranslation('common');
   const cardRef = useRef<HTMLElement | null>(null);
   const gestureRef = useRef<PointerGesture | null>(null);
   const dragXRef = useRef(0);
   const suppressClickRef = useRef(false);
   const hasDistinctLatestRequest = latestRequest.trim() !== firstRequest.trim();
-  const activityTimestamp = formatTimestamp(lastActivity, { includeTime: true }) || 'Unknown time';
+  const activityTimestamp = formatTimestamp(lastActivity, { includeTime: true }) || t('attention.unknownTime');
   const hintId = `session-attention-hint-${provider}-${sessionId}`;
 
   /** Calculate a completion threshold relative to the current card width. */
@@ -193,7 +195,7 @@ export default function SessionAttentionCard({
         <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/20">
           <CheckIcon className="h-5 w-5" />
         </span>
-        {completionProgress >= 1 ? 'Release to complete' : 'Swipe right to complete'}
+        {completionProgress >= 1 ? t('attention.release') : t('attention.swipe')}
       </div>
 
       <article
@@ -220,7 +222,7 @@ export default function SessionAttentionCard({
           <time
             data-slot="session-attention-time"
             dateTime={lastActivity}
-            title={`Last active: ${activityTimestamp}`}
+            title={t('attention.lastActive', { time: activityTimestamp })}
             className="shrink-0 text-xs tabular-nums text-muted-foreground"
           >
             {activityTimestamp}
@@ -228,7 +230,7 @@ export default function SessionAttentionCard({
           <span className="min-w-0 flex-1 truncate text-sm font-medium text-muted-foreground">{projectName}</span>
           <span id={hintId} className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground/80">
             <SwipeArrowIcon className="h-4 w-4" />
-            Swipe right to complete
+            {t('attention.swipe')}
           </span>
         </div>
 
@@ -238,7 +240,7 @@ export default function SessionAttentionCard({
 
         {hasDistinctLatestRequest ? (
           <>
-            <p aria-label="Intermediate requests omitted" className="my-1 text-[15px] leading-6 text-muted-foreground">...</p>
+            <p aria-label={t('attention.omitted')} className="my-1 text-[15px] leading-6 text-muted-foreground">...</p>
             <p className="whitespace-pre-wrap break-words text-[15px] leading-6 text-foreground">
               {latestRequest}
             </p>

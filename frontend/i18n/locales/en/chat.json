@@ -4,7 +4,8 @@
     "estimatedCost": "Estimated cost {{cost}}",
     "costDisclaimer": "{{model}} estimated at standard USD rates; not an actual bill",
     "toolCalls_one": "{{count}} tool call",
-    "toolCalls_other": "{{count}} tool calls"
+    "toolCalls_other": "{{count}} tool calls",
+    "goalCompleted": "Goal completed"
   },
   "codeBlock": {
     "copy": "Copy",

@@ -122,10 +122,10 @@ test('active frontend empty and tool states do not show Claude copy', async () =
     readSource('frontend/components/sidebar/view/subcomponents/SidebarProjectsState.tsx'),
     readSource('frontend/components/main-content/view/subcomponents/MainContentStateView.tsx'),
     readSource('frontend/components/chat/tools/components/InteractiveRenderers/AskUserQuestionPanel.tsx'),
-    readSource('frontend/i18n/locales/en/sidebar.json'),
+    readSource('frontend/i18n/locales/en/sidebar.json').then(genericSidebarCopy),
     readSource('frontend/i18n/locales/en/common.json'),
     readSource('frontend/i18n/locales/en/chat.json'),
-    readSource('frontend/i18n/locales/zh-CN/sidebar.json'),
+    readSource('frontend/i18n/locales/zh-CN/sidebar.json').then(genericSidebarCopy),
     readSource('frontend/i18n/locales/zh-CN/common.json'),
     readSource('frontend/i18n/locales/zh-CN/chat.json'),
   ]);
@@ -207,3 +207,10 @@ test('browser acceptance specs no longer create positive Claude history fixtures
     assert.doesNotMatch(source, /Claude history|Claude session|Claude assistant/);
   }
 });
+
+/** Keep the legacy SDK guard scoped to generic UI; the supported TUI install hint names its CLIs. */
+function genericSidebarCopy(source: string): string {
+  const locale = JSON.parse(source);
+  const { noCli, ...overview } = locale.overview || {};
+  return JSON.stringify({ ...locale, overview });
+}

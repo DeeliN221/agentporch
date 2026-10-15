@@ -210,5 +210,22 @@
       "updateAvailable": "Update available",
       "closeSidebar": "Close sidebar"
     }
+  },
+  "attention": {
+    "title": "Pending sessions",
+    "hint": "Open a session, or swipe a card right to mark it complete",
+    "loading": "Loading pending sessions…",
+    "empty": "No pending sessions",
+    "completeAll": "Mark all complete",
+    "retry": "Retry",
+    "unknownProject": "Unknown project",
+    "unknownTime": "Unknown time",
+    "loadError": "Unable to load pending sessions",
+    "completeError": "Unable to complete the session",
+    "completeAllError": "Unable to complete all sessions",
+    "release": "Release to complete",
+    "swipe": "Swipe right to complete",
+    "lastActive": "Last active: {{time}}",
+    "omitted": "Intermediate requests omitted"
   }
 }

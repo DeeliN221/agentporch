@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 /**
  * PURPOSE: Provide one project-scoped workflow action dialog for adopting
  * active oz changes, starting oz flow runs, and opening ordinary planning sessions.
@@ -39,10 +40,10 @@ type RuntimeCapabilityPayload = {
 };
 
 const STATUS_LABELS: Record<LaunchStatus, string> = {
-  waiting: 'Waiting',
-  starting: 'Starting',
-  started: 'Started',
-  failed: 'Failed',
+  waiting: 'workflowDialog.waiting',
+  starting: 'workflowDialog.starting',
+  started: 'workflowDialog.started',
+  failed: 'workflowDialog.failed',
 };
 
 const PLANNING_PROMPT = [
@@ -73,6 +74,7 @@ export default function WorkflowActionDialog({
   onWorkflowStarted,
   navigateTo,
 }: WorkflowActionDialogProps) {
+  const { t } = useTranslation('sidebar');
   const [changes, setChanges] = useState<string[]>([]);
   const [selectedChanges, setSelectedChanges] = useState<Set<string>>(() => new Set());
   const [results, setResults] = useState<LaunchResult[]>([]);
@@ -83,7 +85,7 @@ export default function WorkflowActionDialog({
   const workflowAvailable = runtimeCapabilities?.capabilities?.workflows === true;
   const planningAvailable = runtimeCapabilities?.capabilities?.manualSessions?.includes('codex') === true;
   const workflowUnavailableMessage = runtimeCapabilities?.commands?.oz?.requiredAction
-    || 'A compatible oz CLI is required to start workflows.';
+    || t('workflowDialog.required');
 
   const selectedCount = selectedChanges.size;
   const allSelected = changes.length > 0 && changes.every((changeName) => selectedChanges.has(changeName));
@@ -107,7 +109,7 @@ export default function WorkflowActionDialog({
       console.error('Error loading adoptable oz changes:', loadError);
       setChanges([]);
       setSelectedChanges(new Set());
-      setError('Unable to load active oz changes.');
+      setError(t('workflowDialog.loadError'));
     } finally {
       setIsLoading(false);
     }
@@ -162,7 +164,7 @@ export default function WorkflowActionDialog({
     }
     const targets = [...selectedChanges];
     if (targets.length === 0) {
-      setError('Select at least one active change.');
+      setError(t('workflowDialog.selectRequired'));
       return;
     }
 
@@ -195,7 +197,7 @@ export default function WorkflowActionDialog({
         console.error('Error starting workflow for oz change:', changeName, startError);
         setResults((current) => current.map((result) => (
           result.changeName === changeName
-            ? { ...result, status: 'failed', error: startError instanceof Error ? startError.message : 'Failed to start' }
+            ? { ...result, status: 'failed', error: startError instanceof Error ? startError.message : t('workflowDialog.startError') }
             : result
         )));
       }
@@ -217,7 +219,7 @@ export default function WorkflowActionDialog({
      * not call the workflow creation API and therefore cannot start oz flow.
      */
     if (!planningAvailable) {
-      setError(runtimeCapabilities?.commands?.codex?.requiredAction || 'The Codex CLI is required to start a planning session.');
+      setError(runtimeCapabilities?.commands?.codex?.requiredAction || t('workflowDialog.codexRequired'));
       return;
     }
     const result = await Promise.resolve(onNewSession(project, 'codex', {
@@ -236,19 +238,19 @@ export default function WorkflowActionDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-label="Workflow actions">
+    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-label={t('workflowDialog.title')}>
       <div className="flex max-h-[86vh] w-full max-w-2xl flex-col rounded-md border border-border bg-background shadow-lg">
         <div className="flex items-start justify-between gap-4 border-b border-border/60 px-5 py-4">
           <div>
-            <h2 className="text-base font-semibold text-foreground">Workflow actions</h2>
-            <p className="mt-1 text-sm text-muted-foreground">Select active oz changes to start their workflows, or begin a new planning session.</p>
+            <h2 className="text-base font-semibold text-foreground">{t('workflowDialog.title')}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">{t('workflowDialog.hint')}</p>
           </div>
           <button
             type="button"
             className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
             onClick={onClose}
             disabled={isStarting}
-            aria-label="Close workflow actions"
+            aria-label={t('workflowDialog.close')}
           >
             <X className="h-4 w-4" />
           </button>
@@ -257,29 +259,29 @@ export default function WorkflowActionDialog({
         <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
           {runtimeCapabilities && !workflowAvailable && (
             <div data-testid="workflow-dependency-missing" className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200">
-              Missing workflow dependency: {workflowUnavailableMessage}
+              {t('workflowDialog.missing', { detail: workflowUnavailableMessage })}
             </div>
           )}
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-sm font-medium text-foreground">Available active changes</div>
+            <div className="text-sm font-medium text-foreground">{t('workflowDialog.available')}</div>
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <span>Selected {selectedCount}</span>
               <button type="button" className="rounded-md border border-border px-2 py-1 hover:bg-accent" onClick={toggleAll} disabled={!workflowAvailable || isLoading || isStarting || changes.length === 0}>
-                {allSelected ? 'Deselect all' : 'Select all'}
+                {allSelected ? t('workflowDialog.deselectAll') : t('workflowDialog.selectAll')}
               </button>
-              <button type="button" className="rounded-md border border-border p-1 hover:bg-accent" onClick={() => void loadChanges()} disabled={!workflowAvailable || isLoading || isStarting} aria-label="Refresh active changes">
+              <button type="button" className="rounded-md border border-border p-1 hover:bg-accent" onClick={() => void loadChanges()} disabled={!workflowAvailable || isLoading || isStarting} aria-label={t('workflowDialog.refresh')}>
                 <RefreshCw className={['h-3.5 w-3.5', isLoading ? 'animate-spin' : ''].join(' ')} />
               </button>
             </div>
           </div>
 
           {!workflowAvailable ? (
-            <div className="rounded-md border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">Install a compatible oz CLI to load and start workflows.</div>
+            <div className="rounded-md border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">{t('workflowDialog.install')}</div>
           ) : isLoading ? (
-            <div className="rounded-md border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">Loading active changes...</div>
+            <div className="rounded-md border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">{t('workflowDialog.loading')}</div>
           ) : changes.length === 0 ? (
             <div className="rounded-md border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">
-              No active oz changes are available.
+              {t('workflowDialog.empty')}
             </div>
           ) : (
             <div className="grid gap-2">
@@ -299,7 +301,7 @@ export default function WorkflowActionDialog({
                   >
                     <span className="min-w-0 flex-1 truncate font-medium text-foreground">{changeName}</span>
                     <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-                      {result ? STATUS_LABELS[result.status] : 'Waiting'}
+                      {result ? t(STATUS_LABELS[result.status]) : t('workflowDialog.waiting')}
                       {selected ? <Check className="h-4 w-4 text-primary" /> : <Square className="h-4 w-4" />}
                     </span>
                   </button>
@@ -310,12 +312,12 @@ export default function WorkflowActionDialog({
 
           {results.length > 0 && (
             <div className="space-y-2 rounded-md border border-border/60 p-3" data-testid="workflow-launch-results">
-              <div className="text-sm font-medium text-foreground">Start results</div>
+              <div className="text-sm font-medium text-foreground">{t('workflowDialog.results')}</div>
               {results.map((result) => (
                 <div key={result.changeName} className="flex flex-wrap items-center justify-between gap-2 text-sm">
                   <div className="min-w-0">
                     <span className="font-medium text-foreground">{result.changeName}</span>
-                    <span className="ml-2 text-muted-foreground">{STATUS_LABELS[result.status]}</span>
+                    <span className="ml-2 text-muted-foreground">{t(STATUS_LABELS[result.status])}</span>
                     {result.error && <span className="ml-2 text-destructive">{result.error}</span>}
                   </div>
                   {result.workflow && (
@@ -327,7 +329,7 @@ export default function WorkflowActionDialog({
                         navigateTo(buildProjectWorkflowRoute(project, result.workflow as ProjectWorkflow));
                       }}
                     >
-                      Open details
+                      {t('workflowDialog.details')}
                     </button>
                   )}
                 </div>
@@ -346,11 +348,11 @@ export default function WorkflowActionDialog({
             disabled={isStarting || !planningAvailable}
           >
             <MessageSquarePlus className="h-4 w-4" />
-            Start a new plan
+            {t('workflowDialog.plan')}
           </button>
           <div className="flex items-center gap-2">
             <button type="button" className="h-9 rounded-md px-3 text-sm text-muted-foreground hover:bg-accent" onClick={onClose} disabled={isStarting}>
-              Cancel
+              {t('workflowDialog.cancel')}
             </button>
             <button
               type="button"
@@ -359,7 +361,7 @@ export default function WorkflowActionDialog({
               disabled={!workflowAvailable || isStarting || selectedCount === 0}
             >
               {isStarting && <Loader2 className="h-4 w-4 animate-spin" />}
-              Start selected workflows
+              {t('workflowDialog.start')}
             </button>
           </div>
         </div>
