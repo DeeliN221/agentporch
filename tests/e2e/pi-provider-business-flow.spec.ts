@@ -1,79 +1,66 @@
 /**
- * Business scenarios: A user creates a Pi session from the project picker.
- * The real draft API allocates the route before any provider session exists.
- * An unbound draft must not appear as a saved provider conversation.
- * Native terminal input carries the new route and project identity.
- * The terminal transport is stubbed to avoid external model calls.
- * Failure meaning: Incorrect init fields can resume another conversation.
- * Render remains read-only and must not send legacy chat commands.
- * Reloading Render must not start an unattended terminal for the user.
+ * Pi web chat sends structured messages without opening an agent terminal.
+ * Business scenarios: The provider picker must expose Pi when its runtime is available.
+ * A new conversation initially owns a stable local route rather than a provider ID.
+ * Draft routes must not appear as persisted provider histories before binding.
+ * Sending must carry both the route identity and the project working directory.
+ * Capturing actual WebSocket frames catches a composer that only clears its text.
+ * A reload must restore the composer without requiring a terminal connection.
+ * Draft restoration protects unsent work when users refresh the page.
+ * Failure meaning: A user can lose access to chat if selection depends on pane focus.
  */
 import { test, expect, type Page } from '@playwright/test';
-import { openFixtureProject, PRIMARY_FIXTURE_PROJECT_PATH, authHeaders } from '../spec/helpers/spec-test-helpers.ts';
+import { authenticatePage, getFixtureProject, authHeaders, PRIMARY_FIXTURE_PROJECT_PATH } from '../spec/helpers/spec-test-helpers.ts';
+import { buildProjectRoute } from '../../frontend/utils/projectRoute.ts';
 
 const messages = new WeakMap<Page, Record<string, any>[]>();
 test.beforeEach(async ({ page }) => {
   messages.set(page, []);
+  page.on('websocket', socket => socket.on('framesent', event => {
+    try { messages.get(page)!.push(JSON.parse(String(event.payload))); } catch { /* Ignore non-JSON frames. */ }
+  }));
   await page.route('**/api/diagnostics/runtime-dependencies', async route => {
-    const response = await route.fetch();
-    const payload = await response.json();
+    const response = await route.fetch(); const payload = await response.json();
     payload.capabilities = { ...payload.capabilities, manualSessions: ['pi', 'codex'] };
     await route.fulfill({ response, json: payload });
   });
-  await page.routeWebSocket('**/shell**', socket => {
-    socket.onMessage(data => {
-      const message = JSON.parse(String(data));
-      messages.get(page)!.push(message);
-      if (message.type === 'init') socket.send(JSON.stringify({ type: 'output', data: 'Pi fixture terminal ready\r\n' }));
-    });
-  });
-  await openFixtureProject(page);
+  await authenticatePage(page);
+  await page.goto(buildProjectRoute(await getFixtureProject(page.request)));
 });
-
 async function createPi(page: Page) {
   await page.getByTestId('project-new-session-button').click();
   await page.getByTestId('project-new-session-provider-pi').click();
-  await expect(page).toHaveURL(/\/c\d+\?tab=shell&provider=pi$/);
-  await expect(page.locator('.xterm')).toBeVisible();
-  await expect.poll(() => messages.get(page)!.filter(message => message.type === 'init').length).toBe(1);
+  await expect(page).toHaveURL(/\/c\d+\?tab=chat&provider=pi$/);
+  await expect(page.locator('textarea.chat-input-placeholder')).toBeVisible();
+  await expect(page.locator('.xterm')).toHaveCount(0);
   return new URL(page.url()).pathname.split('/').at(-1)!;
 }
-
 test('project overview manual-session picker includes Pi', async ({ page }) => {
   await page.getByTestId('project-new-session-button').click();
   await expect(page.getByTestId('project-new-session-provider-pi')).toHaveText('Pi');
 });
-
 test('a new Pi draft is absent from provider history until bound', async ({ page, request }) => {
   const routeId = await createPi(page);
-  const response = await request.get(`/api/projects/fixture-project/overview?${new URLSearchParams({ projectPath: PRIMARY_FIXTURE_PROJECT_PATH })}`, { headers: authHeaders() });
+  const project = await getFixtureProject(request);
+  const response = await request.get(`/api/projects/${encodeURIComponent(project.name)}/overview?${new URLSearchParams({ projectPath: PRIMARY_FIXTURE_PROJECT_PATH })}`, { headers: authHeaders() });
   expect(response.ok()).toBeTruthy();
   const overview = await response.json();
-  expect(overview.piSessions).toBeInstanceOf(Array);
   expect(overview.piSessions.some((session: { id: string }) => session.id === routeId)).toBe(false);
 });
-
-test('Pi input uses native terminal transport with the new route identity', async ({ page }) => {
+test('Pi web input carries the selected route and project identity', async ({ page }) => {
   const routeId = await createPi(page);
-  expect(messages.get(page)!.find(message => message.type === 'init')).toMatchObject({
-    provider: 'pi', routeSessionId: routeId, providerSessionId: null, hasSession: false,
-    projectPath: PRIMARY_FIXTURE_PROJECT_PATH,
+  await page.locator('textarea.chat-input-placeholder').fill('Review the web chat flow');
+  await page.locator('form button[type=submit]').last().click();
+  await expect.poll(() => messages.get(page)!.find(message => message.type === 'pi-command')).toMatchObject({
+    command: 'Review the web chat flow', agentporchSessionId: routeId,
+    options: { projectPath: PRIMARY_FIXTURE_PROJECT_PATH },
   });
-  await page.locator('.xterm-helper-textarea').pressSequentially('Hello Pi');
-  await page.locator('.xterm-helper-textarea').press('Enter');
-  await expect.poll(() => messages.get(page)!.filter(message => message.type === 'input').map(message => message.data).join('')).toContain('Hello Pi\r');
-  await expect(page.locator('textarea.chat-input-placeholder')).toHaveCount(0);
-  expect(messages.get(page)!.some(message => message.type === 'pi-command')).toBe(false);
+  expect(messages.get(page)!.some(message => message.type === 'init')).toBe(false);
 });
-
-test('Pi Render is read-only and reloading it does not initialize a terminal', async ({ page }) => {
+test('reloading web chat leaves the composer available without a terminal', async ({ page }) => {
   await createPi(page);
-  const url = new URL(page.url());
-  url.searchParams.set('tab', 'chat');
-  messages.set(page, []);
-  await page.goto(url.toString(), { waitUntil: 'networkidle' });
-  await expect(page.getByTestId('chat-rendered-snapshot-pane')).toBeVisible();
+  await page.locator('textarea.chat-input-placeholder').fill('Keep this draft');
+  await page.reload();
+  await expect(page.locator('textarea.chat-input-placeholder')).toHaveValue('Keep this draft');
   await expect(page.locator('.xterm')).toHaveCount(0);
-  await expect(page.locator('textarea.chat-input-placeholder')).toHaveCount(0);
-  expect(messages.get(page)!.filter(message => message.type === 'init')).toEqual([]);
 });

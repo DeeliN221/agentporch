@@ -2,7 +2,7 @@
  * PURPOSE: Layout control buttons for the main workspace dock panels.
  * Renders icon-only controls that keep accessible names for dock tab actions.
  */
-const RenderDocument = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth={sw || "2"} fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 12h6"/><path d="M9 16h6"/></svg>;
+const ChatBubble = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth={sw || "2"} fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>;
 const Terminal = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><polyline points="4,17 10,11 4,5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>;
 const Folder = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>;
 const Home = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth={sw || "2"} fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="m3 11 9-8 9 8"/><path d="M5 10v10h14V10"/><path d="M9 20v-6h6v6"/></svg>;
@@ -30,8 +30,8 @@ type TabDefinition = {
 
 const BASE_TABS: TabDefinition[] = [
   { id: 'overview', labelKey: 'tabs.overview', icon: Home },
+  { id: 'chat', labelKey: 'tabs.chat', icon: ChatBubble },
   { id: 'shell', labelKey: 'tabs.shell', icon: Terminal },
-  { id: 'chat', labelKey: 'tabs.chat', icon: RenderDocument },
   { id: 'files', labelKey: 'tabs.files', icon: Folder },
 ];
 

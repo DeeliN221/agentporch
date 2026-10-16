@@ -49,6 +49,7 @@ import {
   isDuplicateComposerSubmit,
 } from './submitDedupPolicy';
 import {
+  getSessionLoadId,
   isAgentPorchRouteSessionId,
   isTemporarySessionId,
   type PendingViewSession,
@@ -257,10 +258,11 @@ export function useChatComposerState({
   onRequestDispatched,
 }: UseChatComposerStateArgs) {
   const permissionMode: PermissionMode = 'bypassPermissions';
+  const composerSessionId = getSessionLoadId(selectedSession);
   const { isConnected } = useWebSocket();
   const [input, setInput] = useState(() => {
     if (typeof window !== 'undefined' && selectedProject) {
-      return safeLocalStorage.getItem(getComposerDraftStorageKey(selectedProject.name)) || '';
+      return safeLocalStorage.getItem(getComposerDraftStorageKey(selectedProject.name, composerSessionId, provider)) || '';
     }
     return '';
   });
@@ -584,6 +586,7 @@ export function useChatComposerState({
         'isConnected:', isConnected);
       const submitBlockReason = getChatSubmitBlockReason({
         input: currentInput,
+        hasAttachments: attachedUploads.length > 0,
         hasProject: Boolean(selectedProject),
         isConnected,
       });
@@ -608,7 +611,6 @@ export function useChatComposerState({
         return;
       }
 
-      const trimmedInput = currentInput.trim();
       const activeProject = selectedProject;
       if (!activeProject) {
         console.warn('[handleSubmit] Blocked: no project after validation');
@@ -806,9 +808,9 @@ export function useChatComposerState({
         runningBehavior = 'steer';
       }
 
-      if (provider === 'codex') {
+      if (provider === 'codex' || provider === 'pi') {
         sendMessage({
-          type: 'codex-command',
+          type: provider === 'pi' ? 'pi-command' : 'codex-command',
           clientRequestId,
           command: messageContent,
           sessionId: effectiveSessionId,
@@ -833,7 +835,8 @@ export function useChatComposerState({
             client_ref: messageContent,
             turnAnchorKey,
             resume: Boolean(effectiveSessionId),
-            model: codexModel,
+            model: provider === 'pi' ? piModel : codexModel,
+            thinkingLevel: provider === 'pi' ? piThinkingLevel : undefined,
             reasoningEffort: codexReasoningEffort,
             serviceTier: codexServiceTier || null,
             permissionMode,
@@ -861,10 +864,11 @@ export function useChatComposerState({
         textareaRef.current.style.height = 'auto';
       }
 
-      safeLocalStorage.removeItem(getComposerDraftStorageKey(activeProject.name));
+      safeLocalStorage.removeItem(getComposerDraftStorageKey(activeProject.name, composerSessionId, provider));
     },
     [
       attachedUploads,
+      composerSessionId,
       codexModel,
       piModel,
       piThinkingLevel,
@@ -941,28 +945,28 @@ export function useChatComposerState({
     if (initialPrompt.trim()) {
       setInput(initialPrompt);
       inputValueRef.current = initialPrompt;
-      safeLocalStorage.setItem(getComposerDraftStorageKey(selectedProject.name), initialPrompt);
+      safeLocalStorage.setItem(getComposerDraftStorageKey(selectedProject.name, composerSessionId, provider), initialPrompt);
       return;
     }
-    const savedInput = safeLocalStorage.getItem(getComposerDraftStorageKey(selectedProject.name)) || '';
+    const savedInput = safeLocalStorage.getItem(getComposerDraftStorageKey(selectedProject.name, composerSessionId, provider)) || '';
     setInput((previous) => {
       const next = previous === savedInput ? previous : savedInput;
       inputValueRef.current = next;
       return next;
     });
-  }, [selectedProject?.name, selectedSession?.id, selectedSession?.initialPrompt]);
+  }, [selectedProject?.name, selectedSession?.id, selectedSession?.initialPrompt, composerSessionId, provider]);
 
   useEffect(() => {
     if (!selectedProject) {
       return;
     }
-    const draftKey = getComposerDraftStorageKey(selectedProject.name);
+    const draftKey = getComposerDraftStorageKey(selectedProject.name, composerSessionId, provider);
     if (input !== '' && shouldPersistComposerDraft({ input, projectName: selectedProject.name })) {
       safeLocalStorage.setItem(draftKey, input);
     } else {
       safeLocalStorage.removeItem(draftKey);
     }
-  }, [input, selectedProject]);
+  }, [input, selectedProject, composerSessionId, provider]);
 
   useEffect(() => {
     if (!textareaRef.current) {

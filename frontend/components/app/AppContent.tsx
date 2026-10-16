@@ -2,7 +2,7 @@
  * Application shell composition.
  * Wires shared WebSocket state, project/session selection, and main layout containers together.
  */
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import Sidebar from '../sidebar/view/Sidebar';
 import MainContent from '../main-content/view/MainContent';
@@ -15,7 +15,6 @@ import { useUiPreferences } from '../../hooks/useUiPreferences';
 import type { Project, ProjectSession, SessionProvider } from '../../types/app';
 import { buildProjectSessionRoute, buildWorkflowChildSessionRoute } from '../../utils/projectRoute';
 import { findWorkflowChildSession, hasWorkflowChildSession } from '../../utils/workflowSessions';
-import { authenticatedFetch } from '../../utils/api';
 
 const ChatHistorySearchDialog = lazy(() => import('../chat/view/ChatHistorySearchDialog'));
 
@@ -74,7 +73,6 @@ export default function AppContent() {
   const navigate = useNavigate();
   const location = useLocation();
   const [isChatSearchOpen, setIsChatSearchOpen] = useState(false);
-  const [renderSnapshotRequestId, setRenderSnapshotRequestId] = useState(0);
   const { isMobile } = useDeviceSettings({ trackPWA: false });
   const { preferences, setPreference } = useUiPreferences();
   const { sidebarVisible } = preferences;
@@ -126,22 +124,6 @@ export default function AppContent() {
   const handleDesktopSidebarCollapse = useCallback(() => {
     setPreference('sidebarVisible', false);
   }, [setPreference]);
-
-  const renderLocationRef = useRef(location.pathname);
-  renderLocationRef.current = location.pathname;
-  const handleResolveFocusedSession = useCallback(async (terminalPid: number) => {
-    /** Resolve focus before loading history, and discard responses after navigation. */
-    if (!selectedProject || selectedProject.readOnlyProviderCollection) return null;
-    const requestedLocation = location.pathname;
-    const response = await authenticatedFetch(`/api/projects/${encodeURIComponent(selectedProject.name)}/current-tmux-session?projectPath=${encodeURIComponent(selectedSession?.projectPath || selectedProject.fullPath || selectedProject.path || '')}&terminalPid=${terminalPid}`, { signal: AbortSignal.timeout(8000) });
-    if (renderLocationRef.current !== requestedLocation) return null;
-    if (!response.ok) throw new Error('Unable to detect the current terminal session. Try again.');
-    const current = await response.json() as { status: string; session?: ProjectSession | null };
-    if (renderLocationRef.current !== requestedLocation) return null;
-    if (current.status === 'no-tmux') return null;
-    if (!current.session) throw new Error('No renderable session was found in this terminal. Start a session there and try again.');
-    return current.session;
-  }, [selectedProject, selectedSession?.projectPath, location.pathname]);
 
   useEffect(() => {
     window.refreshProjects = handleSidebarRefresh;
@@ -394,9 +376,6 @@ export default function AppContent() {
       onShowSettings={() => setShowSettings(true)}
       onRefresh={handleSidebarRefresh}
       externalMessageUpdate={externalMessageUpdate}
-      renderSnapshotRequestId={renderSnapshotRequestId}
-      onRenderSnapshotRequest={() => setRenderSnapshotRequestId((previous) => previous + 1)}
-      onResolveFocusedSession={handleResolveFocusedSession}
     />
   );
 

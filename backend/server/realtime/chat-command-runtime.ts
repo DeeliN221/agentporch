@@ -416,10 +416,6 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
              * PURPOSE: Keep command branching and provider runtime calls outside the
              * WebSocket lifecycle handler while preserving the legacy command behavior.
              */
-                if (data.type === 'pi-command') {
-                    writer.send({ type: 'pi-error', error: 'Pi supports only the tmux TUI' });
-                    return;
-                }
                 console.log('📨 Chat message received:', data.type);
                 if (data.type === 'claude-command') {
                     writer.send({ type: 'claude-error', error: 'Provider "claude" is no longer supported' });
@@ -509,7 +505,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         : {};
                     const codexOptions: LooseRecord = {
                         ...codexProviderOptions,
-                        reasoningEffort: sessionModelState.reasoningEffort || codexProviderOptions?.reasoningEffort,
+                        reasoningEffort: codexProviderOptions?.reasoningEffort || sessionModelState.reasoningEffort,
                         serviceTier: codexProviderOptions?.serviceTier || data.options?.serviceTier || '',
                     };
                     const codexPromptText = buildProviderPromptText(
@@ -520,7 +516,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                     const result = await sendNativeMessage({
                         provider: 'codex',
                         sessionId: agentporchSessionId || effectiveSessionId || `codex-${Date.now()}`,
-                        providerSessionId: codexManualRuntime?.providerSessionId || '',
+                        providerSessionId: codexManualRuntime?.providerSessionId || (isAgentPorchRouteSessionId(effectiveSessionId) ? '' : effectiveSessionId) || '',
                         projectPath: codexOptions?.projectPath || codexOptions?.cwd || '',
                         text: codexPromptText,
                         runningBehavior: data.options?.runningBehavior || (data.options?.activePolicy === 'queue' ? 'queue' : undefined),
@@ -632,7 +628,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                     const result = await sendNativeMessage({
                         provider: 'pi',
                         sessionId: agentporchSessionId || effectiveSessionId || `pi-${Date.now()}`,
-                        providerSessionId: piManualRuntime?.providerSessionId || '',
+                        providerSessionId: piManualRuntime?.providerSessionId || (isAgentPorchRouteSessionId(effectiveSessionId) ? '' : effectiveSessionId) || '',
                         projectPath: piProviderOptions?.projectPath || piProviderOptions?.cwd || '',
                         text: piPromptText,
                         runningBehavior: data.options?.runningBehavior || (data.options?.activePolicy === 'steer' ? 'steer' : data.options?.activePolicy === 'followUp' ? 'followUp' : undefined),
@@ -767,7 +763,9 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
         return {
             dispatchChatCommand(data: ChatInboundMessage): void {
                 routeChatCommand((message) => {
-                    void handleChatCommand(message as ChatInboundMessage);
+                    void handleChatCommand(message as ChatInboundMessage).catch(error => {
+                        sendProtocolError(message as ChatInboundMessage, error);
+                    });
                 }, data);
             },
             sendProtocolError,

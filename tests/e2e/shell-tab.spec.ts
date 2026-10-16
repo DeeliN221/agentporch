@@ -169,18 +169,16 @@ for (const width of [1440, 390]) {
       .getByRole('button', { name: /fixture-project manu/i }).first().click();
 
     await expect(page.getByTestId('tab-chat')).toHaveAttribute('aria-pressed', 'true');
-    await expect(page.getByTestId('chat-rendered-snapshot-pane')).toBeVisible();
-    await expect(page.getByTestId('chat-rendered-snapshot-pane')).toContainText('fixture-project manual-only session');
-    await expect(page.getByTestId('chat-rendered-snapshot-pane')
-      .locator('textarea, input, [contenteditable="true"]')).toHaveCount(0);
+    await expect(page.getByTestId('web-chat')).toBeVisible();
+    await expect(page.getByTestId('web-chat')).toContainText('fixture-project manual-only session');
+    await expect(page.getByTestId('web-chat').locator('textarea.chat-input-placeholder')).toBeVisible();
     await expect(page.locator('.xterm')).toHaveCount(0);
     expect(await page.evaluate(() => (window.__trackedSockets || [])
       .filter((socket) => String(socket.url).includes('/shell')).length)).toBe(0);
     await page.screenshot({ path: testInfo.outputPath('history-default.png') });
     await page.reload({ waitUntil: 'networkidle' });
-    await expect(page.getByTestId('chat-rendered-snapshot-pane')).toContainText('fixture-project manual-only session');
-    await expect(page.getByTestId('chat-rendered-snapshot-pane')
-      .locator('textarea, input, [contenteditable="true"]')).toHaveCount(0);
+    await expect(page.getByTestId('web-chat')).toContainText('fixture-project manual-only session');
+    await expect(page.getByTestId('web-chat').locator('textarea.chat-input-placeholder')).toBeVisible();
     await expect(page.locator('.xterm')).toHaveCount(0);
   });
 }

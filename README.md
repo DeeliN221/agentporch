@@ -1,6 +1,6 @@
 # AgentPorch
 
-**Claude Code, Codex, and Pi. One browser workspace.**
+**Web chat for Codex and Pi. Terminals when you need them.**
 
 Keep your coding agents on your own machine and bring their sessions to your browser. AgentPorch puts conversations, tool calls, project files, and terminals together so you can follow a task, inspect the result, and continue working from another device.
 
@@ -14,9 +14,21 @@ Keep your coding agents on your own machine and bring their sessions to your bro
 
 *Illustrative views of the actual layouts. All text and project content is replaced with gray placeholders; no real session data is shown.*
 
+## Chat first, terminal when needed
+
+New and existing conversations open in web chat. Send messages, attach files or
+paste images, and follow responses and tool results without opening a terminal.
+Codex uses its shared app-server; Pi uses the native SDK runtime. Browser navigation
+and disconnects do not send an abort command to either runtime.
+
+The terminal is an independent, persistent tmux-backed project shell for advanced
+work. Switching panes or directories never changes the conversation selected in
+chat. Opening it does not launch a second agent for that conversation. Imported
+Hermes and legacy Claude histories remain read-only in web chat.
+
 ## Why try it?
 
-- **Choose your agent.** Start and resume Claude Code, Codex, or Pi sessions from the same workspace.
+- **Choose your agent.** Start and resume Codex or Pi conversations, and browse imported Claude and Hermes history.
 - **See the work happen.** Follow streaming responses and tool calls alongside your project files.
 - **Keep your tools nearby.** Browse files, edit code, and open a terminal without leaving the session.
 - **Pick up from another device.** Use a trusted HTTPS proxy or private tunnel to reach your workspace from a laptop or phone. HTTPS also enables the installable PWA.

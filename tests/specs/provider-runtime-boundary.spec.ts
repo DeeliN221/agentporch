@@ -179,7 +179,7 @@ async function buildRuntimeSourceAudit(): Promise<RuntimeSourceAudit> {
   return audit;
 }
 
-test('provider runtime boundary keeps only Codex on app-server and external providers on tmux TUI', async () => {
+test('provider runtime boundary uses Codex app-server and Pi SDK independently of terminals', async () => {
   assert.ok(EVIDENCE_CONTRACTS.some((entry) => entry.includes('provider-runtime-source-audit')));
   const router = await readRepoFile('backend/domains/provider-runtime/runtime-router.ts');
   const events = await readRepoFile('backend/domains/provider-runtime/provider-runtime-events.ts');
@@ -188,9 +188,9 @@ test('provider runtime boundary keeps only Codex on app-server and external prov
 
   assertExports(router, 'sendProviderRuntimeMessage');
   assert.match(router, /sendCodexAppServerMessage/, 'Codex branch must call app-server facade');
-  assert.match(router, /provider !== ['"]codex['"][\s\S]*accepted: false/, 'runtime facade must reject Pi/Claude SDK or RPC execution');
+  assert.match(router, /ensurePiSession/, 'Pi web chat uses the native SDK runtime');
   const composer = await readRepoFile('frontend/components/chat/composer/useChatComposerStateRuntime.impl.ts');
-  assert.doesNotMatch(composer, /type:\s*['"]pi-command['"]/, 'browser composer must not send Pi runtime commands');
+  assert.match(composer, /['"]pi-command['"]/, 'browser composer dispatches Pi messages');
   assert.doesNotMatch(composer, /type:\s*['"]claude-command['"]/, 'browser composer must not send Claude runtime commands');
   assertExports(events, 'toProviderSessionStatusEvent');
   assertExports(events, 'toProviderRuntimeErrorEvent');
