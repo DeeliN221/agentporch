@@ -12,7 +12,7 @@ export type DeliveryStatus = NonNullable<ChatMessage['deliveryStatus']>;
  * to the confirmed green user bubble before JSONL history catches up.
  */
 export function markAcceptedDeliveryPersisted(status: ChatMessage['deliveryStatus']): DeliveryStatus {
-  if (status === 'pending' || status === 'sent') {
+  if (status === 'pending' || status === 'sent' || status === 'failed') {
     return 'persisted';
   }
   return status || 'persisted';

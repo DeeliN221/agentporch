@@ -20,8 +20,8 @@
   "tabs": {
     "overview": "Home",
     "workflows": "Workflows",
-    "chat": "Render",
-    "rendering": "Rendering",
+    "chat": "Chat",
+    "rendering": "Loading chat",
     "shell": "Shell",
     "files": "Files"
   },

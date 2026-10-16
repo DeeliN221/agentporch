@@ -7,7 +7,7 @@ import type { MutableRefObject } from 'react';
 import { isTemporarySessionId, type PendingViewSession } from '../session/sessionIdentity';
 import { isHermesScopedSessionId } from '../../../utils/providerCapabilities';
 
-type StatusProvider = 'codex' | 'pi';
+type StatusProvider = 'codex' | 'pi' | 'claude';
 
 type UseChatStatusReconcileArgs = {
   canAbortSession: boolean;
@@ -65,12 +65,12 @@ export function useChatStatusReconcile({
 
     if (isHermesScopedSessionId(statusSessionId)) return;
 
-    if (effectiveProvider === 'claude' || effectiveProvider === 'hermes' || selectedSessionProviderScope) {
-      /** Claude runs in the tmux TUI and has no native AgentPorch runtime state to reconcile. */
+    if (effectiveProvider === 'hermes' || selectedSessionProviderScope) {
+      /** Imported Hermes histories do not have a local runtime. */
       return;
     }
 
-    const statusProvider: StatusProvider = effectiveProvider === 'pi' ? 'pi' : 'codex';
+    const statusProvider: StatusProvider = effectiveProvider === 'claude' ? 'claude' : effectiveProvider === 'pi' ? 'pi' : 'codex';
     const statusProjectPath = selectedSessionProjectPath || selectedProjectPath;
     const reconcileKey = buildReconcileKey(statusProvider, statusSessionId, activeRouteSessionId, statusProjectPath);
 

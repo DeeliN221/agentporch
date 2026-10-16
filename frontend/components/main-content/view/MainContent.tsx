@@ -103,32 +103,18 @@ function MainContent({
   onShowSettings,
   onRefresh,
   externalMessageUpdate,
-  renderSnapshotRequestId,
-  onRenderSnapshotRequest,
-  onResolveFocusedSession,
   headerLeadingContent,
 }: MainContentProps) {
   /** activeTab owns the main view; desktop sidebars update only their own layout state. */
   const { preferences } = useUiPreferences();
   const { autoExpandTools, showRawParameters, showThinking, autoScrollToBottom } = preferences;
-  const [isRenderingSnapshot, setIsRenderingSnapshot] = React.useState(false);
-  const [isResolvingFocus, setIsResolvingFocus] = React.useState(false);
-  const [renderTargetError, setRenderTargetError] = React.useState('');
-  const renderRequestRef = React.useRef(0);
-  const renderScopeRef = React.useRef('');
-  renderScopeRef.current = `${selectedProject?.fullPath}:${selectedSession?.id}:${activeTab}`;
   const readOnlyProviderCollection = selectedProject?.readOnlyProviderCollection === true;
-  const terminalScope = `${selectedProject?.fullPath || selectedProject?.path}:${selectedSession?.__provider}:${selectedSession?.id}:${selectedWorkflow?.id}`;
+  const terminalScope = selectedProject?.fullPath || selectedProject?.path || '';
   const [openedTerminalScope, setOpenedTerminalScope] = React.useState<string | null>(null);
   if (activeTab === 'shell' && selectedProject && openedTerminalScope !== terminalScope) {
     setOpenedTerminalScope(terminalScope);
   }
-  const terminalClientRef = React.useRef<{ scope: string; pid: number | null } | null>(null);
-  const handleTerminalClientReady = React.useCallback((pid: number | null) => {
-    terminalClientRef.current = { scope: terminalScope, pid };
-  }, [terminalScope]);
-  const [renderSelection, setRenderSelection] = React.useState<{ scope: string; session: ProjectSession } | null>(null);
-  const transcriptSession = renderSelection?.scope === terminalScope ? renderSelection.session : selectedSession;
+  const transcriptSession = selectedSession;
 
   const projectSessions = selectedProject ? getAllSessions(selectedProject, {}, true) : [];
   const [revealDirectoryRequest, setRevealDirectoryRequest] = React.useState<{ path: string; requestId: number } | null>(null);
@@ -186,22 +172,6 @@ function MainContent({
     setTerminalInstances([initialTerminal]);
     setActiveTerminalId(initialTerminal.id);
   }, [selectedProject?.fullPath, selectedProject?.path, selectedProject?.name]);
-
-  useEffect(() => {
-    /**
-     * Reset render progress when moving to a different session.
-     */
-    setIsRenderingSnapshot(false);
-  }, [selectedSession?.id]);
-
-  useEffect(() => {
-    /**
-     * Reset render progress when leaving the rendered transcript view.
-     */
-    if (activeTab !== 'chat') {
-      setIsRenderingSnapshot(false);
-    }
-  }, [activeTab]);
 
   const handleCreateTerminal = React.useCallback(() => {
     /**
@@ -335,36 +305,9 @@ function MainContent({
   // Wrap setActiveTab to handle dock toggle on user clicks without useEffect loops
   const handleSetActiveTab = React.useCallback(
     async (value: React.SetStateAction<AppTab>) => {
-      /** Read live terminal focus before selecting or refreshing rendered history. */
+      /** Switch workspace views without changing the selected conversation. */
       const nextTab = typeof value === 'function' ? value(activeTab) : value;
-      const requestId = ++renderRequestRef.current;
-      setRenderTargetError('');
       if (readOnlyProviderCollection && nextTab !== 'overview' && nextTab !== 'chat') return;
-
-      if (nextTab === 'chat' && selectedProject && onResolveFocusedSession && openedTerminalScope === terminalScope) {
-        const scope = renderScopeRef.current;
-        setIsResolvingFocus(true);
-        try {
-          const client = terminalClientRef.current;
-          if (client?.scope !== terminalScope || !client.pid) throw new Error('Terminal is reconnecting. Try Render again once it is connected.');
-          const resolved = await onResolveFocusedSession(client.pid);
-          if (requestId !== renderRequestRef.current || scope !== renderScopeRef.current) return;
-          if (!resolved) throw new Error('No renderable session was found in the active pane.');
-          setRenderSelection({ scope: terminalScope, session: resolved });
-          setActiveTab('chat');
-          onRenderSnapshotRequest?.();
-          return;
-        } catch (error) {
-          if (requestId === renderRequestRef.current && scope === renderScopeRef.current) {
-            setRenderTargetError(error instanceof Error ? error.message : 'Unable to detect the current terminal session. Try again.');
-          }
-          return;
-        } finally {
-          if (requestId === renderRequestRef.current) setIsResolvingFocus(false);
-        }
-      } else {
-        setIsResolvingFocus(false);
-      }
 
       if (nextTab === 'overview') {
         if (selectedProject && (selectedSession || selectedWorkflow)) {
@@ -380,7 +323,6 @@ function MainContent({
         if (targetSession) {
           setActiveTab('chat');
           onSelectSession(targetSession);
-          onRenderSnapshotRequest?.();
         } else {
           setActiveTab('chat');
         }
@@ -389,7 +331,6 @@ function MainContent({
 
       if (nextTab === 'chat' && selectedSession) {
         setActiveTab('chat');
-        onRenderSnapshotRequest?.();
         return;
       }
 
@@ -412,7 +353,7 @@ function MainContent({
 
       setActiveTab(nextTab);
     },
-    [activeTab, openedTerminalScope, terminalScope, isMobile, layout.rightDock.activePanel, layout.rightDock.collapsed, layout.lowerPanel.activePanel, layout.lowerPanel.collapsed, onRenderSnapshotRequest, onResolveFocusedSession, onSelectProjectOverview, onSelectSession, projectSessions, readOnlyProviderCollection, selectedProject, selectedSession, selectedWorkflow, setRightDock, setLowerPanel, setActiveTab],
+    [activeTab, isMobile, layout.rightDock.activePanel, layout.rightDock.collapsed, layout.lowerPanel.activePanel, layout.lowerPanel.collapsed, onSelectProjectOverview, onSelectSession, projectSessions, readOnlyProviderCollection, selectedProject, selectedSession, selectedWorkflow, setRightDock, setLowerPanel, setActiveTab],
   );
 
   const openFilesDock = React.useCallback((directoryPath?: string) => {
@@ -454,8 +395,6 @@ function MainContent({
       onMenuClick={onMenuClick}
       leadingContent={headerLeadingContent}
       onRefresh={onRefresh}
-      isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
-        renderTargetError={renderTargetError}
       readOnlyProviderCollection={readOnlyProviderCollection}
       dockLayout={isMobile ? undefined : {
         rightDockActive: layout.rightDock.activePanel,
@@ -519,7 +458,7 @@ function MainContent({
             <ErrorBoundary showDetails>
               <React.Suspense fallback={<DeferredPanelFallback label="Loading chat…" />}>
                 <ChatInterface
-                  key={`chat-${transcriptSession?.id || 'project'}-${transcriptSession?.__provider || 'codex'}`}
+                  key={`chat-${selectedProject?.fullPath || selectedProject?.path}-${transcriptSession?.routeIndex || transcriptSession?.id || 'project'}-${transcriptSession?.__provider || 'codex'}`}
                   selectedProject={selectedProject}
                   selectedSession={transcriptSession}
                   ws={ws}
@@ -539,9 +478,6 @@ function MainContent({
                   showThinking={showThinking}
                   autoScrollToBottom={autoScrollToBottom}
                   externalMessageUpdate={externalMessageUpdate}
-                  renderSnapshotRequestId={renderSnapshotRequestId}
-                  renderTranscriptOnMount={activeTab === 'chat'}
-                  onRenderSnapshotLoadingChange={setIsRenderingSnapshot}
                 />
               </React.Suspense>
             </ErrorBoundary>
@@ -556,17 +492,16 @@ function MainContent({
           <StandaloneShell
             key={terminalScope}
             project={selectedProject}
-            session={selectedSession}
+            session={null}
             command={null}
-            isPlainShell={!selectedSession}
+            isPlainShell
             showHeader={false}
             minimal
-            onTerminalClientReady={handleTerminalClientReady}
           />
         )}
       </div>
       <div key="content" className={`flex-1 min-h-0 min-w-0 flex-col ${activeTab === 'shell' ? 'hidden' : 'flex'}`}>
-        {activeTab !== 'shell' && content}
+        {content}
       </div>
     </>
   );
@@ -589,8 +524,6 @@ function MainContent({
           onMenuClick={onMenuClick}
           leadingContent={headerLeadingContent}
           onRefresh={onRefresh}
-          isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
-        renderTargetError={renderTargetError}
           dockLayout={{
             rightDockActive: layout.rightDock.activePanel,
             rightDockCollapsed: layout.rightDock.collapsed,
@@ -669,8 +602,6 @@ function MainContent({
           onMenuClick={onMenuClick}
           leadingContent={headerLeadingContent}
           onRefresh={onRefresh}
-          isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
-        renderTargetError={renderTargetError}
           dockLayout={{
             rightDockActive: layout.rightDock.activePanel,
             rightDockCollapsed: layout.rightDock.collapsed,
@@ -771,8 +702,6 @@ function MainContent({
           onMenuClick={onMenuClick}
           leadingContent={headerLeadingContent}
           onRefresh={onRefresh}
-          isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
-        renderTargetError={renderTargetError}
           readOnlyProviderCollection={readOnlyProviderCollection}
           dockLayout={{
             rightDockActive: layout.rightDock.activePanel,
@@ -864,8 +793,6 @@ function MainContent({
         onMenuClick={onMenuClick}
         leadingContent={headerLeadingContent}
         onRefresh={onRefresh}
-        isRenderingSnapshot={isRenderingSnapshot || isResolvingFocus}
-        renderTargetError={renderTargetError}
         readOnlyProviderCollection={readOnlyProviderCollection}
         dockLayout={{
           rightDockActive: layout.rightDock.activePanel,

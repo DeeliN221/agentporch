@@ -112,3 +112,20 @@ it('chatRealtimeEventRouter and streamingMessageController expose real routing a
   finalizeStreamingMessage(setMessages);
   expect(Array.isArray(messages)).toBe(true);
 });
+
+it('web chat accepts attachment-only input but still requires a connected project', async () => {
+  const { getChatSubmitBlockReason } = await import('../../frontend/components/chat/composer/chatSubmitController');
+  expect(getChatSubmitBlockReason({ input: '', hasAttachments: true, hasProject: true, isConnected: true })).toBeNull();
+  expect(getChatSubmitBlockReason({ input: '', hasAttachments: false, hasProject: true, isConnected: true })).toBe('empty-input');
+  expect(getChatSubmitBlockReason({ input: '', hasAttachments: true, hasProject: true, isConnected: false })).toBe('disconnected');
+});
+
+it('drafts do not leak between conversations or providers in the same project', async () => {
+  const { getComposerDraftStorageKey } = await import('../../frontend/components/chat/composer/composerDraftState');
+  const keys = new Set([
+    getComposerDraftStorageKey('sample', 'c1', 'codex'),
+    getComposerDraftStorageKey('sample', 'c2', 'codex'),
+    getComposerDraftStorageKey('sample', 'c1', 'pi'),
+  ]);
+  expect(keys.size).toBe(3);
+});

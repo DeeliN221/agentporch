@@ -366,6 +366,8 @@ export function useChatRealtimeHandlers({
         latestMessage.agentporchSessionId || latestMessage.agentporch_session_id || latestMessage.sessionId;
       const isSystemInitForView =
         systemInitSessionId && (!activeViewSessionId || systemInitSessionId === activeViewSessionId);
+      if (latestMessage.type !== 'projects_updated' && latestMessage.provider && latestMessage.provider !== (selectedSession?.__provider || provider)) return;
+      if (latestMessage.type !== 'projects_updated' && !isMessageForSelectedProject(latestMessage, selectedProject, selectedSession)) return;
       const shouldBypassSessionFilter = isGlobalMessage
         || Boolean(isSystemInitForView)
         || (latestMessage.type === 'session-created' && isTemporaryViewSession)
@@ -748,6 +750,8 @@ export function useChatRealtimeHandlers({
         break;
 
       case 'claude-error':
+        clearLoadingIndicators();
+        markSessionsAsCompleted(currentSessionId, selectedSession?.id);
         updateChatMessages({ type: 'errorMessageAppended', content: `Error: ${latestMessage.error}` });
         break;
 
@@ -1092,14 +1096,16 @@ export function useChatRealtimeHandlers({
         });
         break;
 
+      case 'session-start-rejected':
       case 'message-rejected':
+        if (latestMessage.type === 'session-start-rejected' || ['uncertain', 'admission-failed', 'preflight-rejected'].includes(latestMessage.reason || '')) clearLoadingIndicators();
         // A steer/message rejection only rejects the specific optimistic message,
         // not the entire active turn. Keep the running state intact so the
         // session can continue processing or accept further steers.
         updateChatMessages({
           type: 'pendingUserMessageRejected',
           clientRequestId: latestMessage.clientRequestId,
-          errorContent: latestMessage.error || 'Message was rejected by the running process.',
+          errorContent: `${latestMessage.error || latestMessage.reason || 'Message was rejected by the running process.'}${latestMessage.originalCommand ? `\n\nOriginal message: ${latestMessage.originalCommand}` : ''}`,
         });
         break;
 

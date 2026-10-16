@@ -1,6 +1,6 @@
 # AgentPorch
 
-**Claude Code, Codex, and Pi. One browser workspace.**
+**Web chat for Codex, Pi, and Claude Code. Terminals when you need them.**
 
 Keep your coding agents on your own machine and bring their sessions to your browser. AgentPorch puts conversations, tool calls, project files, and terminals together so you can follow a task, inspect the result, and continue working from another device.
 
@@ -14,9 +14,30 @@ Keep your coding agents on your own machine and bring their sessions to your bro
 
 *Illustrative views of the actual layouts. All text and project content is replaced with gray placeholders; no real session data is shown.*
 
+## Chat first, terminal when needed
+
+New and existing conversations open in web chat. Send messages, attach files or
+paste images, and follow responses and tool results without opening a terminal.
+Codex uses its shared app-server; Pi uses the native SDK runtime; Claude Code uses its [documented print/stream-json CLI](https://code.claude.com/docs/en/headless). Browser navigation
+and disconnects do not send an abort command to either runtime.
+
+The terminal is an independent, persistent tmux-backed project shell for advanced
+work. Switching panes or directories never changes the conversation selected in
+chat. Opening it does not launch a second agent for that conversation. Imported
+Hermes histories remain read-only in web chat.
+
+Claude Code requires an installed, authenticated `claude` CLI. Web messages use
+its local model and tool permission settings (including `AGENTPORCH_CLAUDE_ENV_FILE`
+when configured), without enabling bypass permissions. Tools requiring interactive
+approval are denied in print mode; configure the local allowed tools or use the
+advanced terminal for interactive approval. Each conversation runs at most one
+web-owned process, with later turns resumed by UUID. Stop interrupts the current
+turn; browser disconnects leave it running. Do not open that same Claude session
+in an external CLI while a web turn is active.
+
 ## Why try it?
 
-- **Choose your agent.** Start and resume Claude Code, Codex, or Pi sessions from the same workspace.
+- **Choose your agent.** Start and resume Codex, Pi, or Claude Code conversations, and browse imported Hermes history.
 - **See the work happen.** Follow streaming responses and tool calls alongside your project files.
 - **Keep your tools nearby.** Browse files, edit code, and open a terminal without leaving the session.
 - **Pick up from another device.** Use a trusted HTTPS proxy or private tunnel to reach your workspace from a laptop or phone. HTTPS also enables the installable PWA.

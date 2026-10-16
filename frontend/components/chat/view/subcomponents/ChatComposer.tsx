@@ -7,6 +7,7 @@ const Command = ({ className: cls, strokeWidth: sw }: { className?: string; stro
 const FileUp = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/><path d="M12 12v6"/><path d="m15 15-3-3-3 3"/></svg>;
 const FolderUp = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><path d="M12 11v6"/><path d="m9 14 3-3 3 3"/></svg>;
 const Paperclip = ({ className: cls, strokeWidth: sw }: { className?: string; strokeWidth?: number }) => <svg className={cls || "w-4 h-4"} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a5.99 5.99 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>;
+import type { DropzoneState } from 'react-dropzone';
 import CommandMenu from './CommandMenu';
 import MicButton from '../../../mic-button/view/MicButton';
 import ImageAttachment from './ImageAttachment';
@@ -102,8 +103,8 @@ interface ChatComposerProps {
   onCloseCommandMenu: () => void;
   isCommandMenuOpen: boolean;
   frequentCommands: SlashCommand[];
-  getRootProps: (...args: unknown[]) => Record<string, unknown>;
-  getInputProps: (...args: unknown[]) => Record<string, unknown>;
+  getRootProps: DropzoneState['getRootProps'];
+  getInputProps: DropzoneState['getInputProps'];
   openAttachmentPicker: () => void;
   onAttachmentSelection: (event: ChangeEvent<HTMLInputElement>) => void;
   inputHighlightRef: RefObject<HTMLDivElement>;
@@ -202,7 +203,7 @@ export default function ChatComposer({
   const uploadMenuRef = useRef<HTMLDivElement>(null);
   const fileSearchInputRef = useRef<HTMLInputElement>(null);
   const trimmedInput = input.trim();
-  const canSubmit = !isComposerSubmitting && Boolean(trimmedInput) && isConnected;
+  const canSubmit = !isComposerSubmitting && Boolean(trimmedInput || attachedUploads.length) && isConnected;
   const piSteeringCount = piQueueState?.steering.length || 0;
   const piFollowUpCount = piQueueState?.followUp.length || 0;
   const showPiRunningQueue = provider === 'pi' && isLoading && Boolean(activeTurnStartedAt);
@@ -583,6 +584,7 @@ export default function ChatComposer({
                   </button>
                 )}
 
+                {provider === 'claude' && <span className="px-2 text-xs text-muted-foreground">Claude Code · local settings</span>}
                 {(provider === 'codex' || provider === 'pi') && (
                   <SessionModelControls
                     provider={provider}
@@ -642,6 +644,7 @@ export default function ChatComposer({
                   ) : (
 	                    <button
 	                      type="submit"
+                          aria-label={t('input.send', { defaultValue: 'Send message' })}
 	                      disabled={!canSendCurrentProvider}
 	                      className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-primary/30"
 	                      title={!isConnected ? 'WebSocket disconnected' : undefined}

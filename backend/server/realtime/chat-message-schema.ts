@@ -1,6 +1,6 @@
 /**
  * Normalize inbound chat WebSocket commands.
- * Parse Codex, abort, and subscription commands consistently; Pi/Claude use the tmux TUI only.
+ * Parse provider messages, abort, and subscription commands consistently.
  */
 
 export type ChatCommandType =

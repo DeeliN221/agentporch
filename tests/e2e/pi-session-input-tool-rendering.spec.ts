@@ -23,14 +23,14 @@ const RUNNING_COMMAND = 'sleep 60';
 const READ_PATH = 'src/components/chat/view/subcomponents/SessionModelControls.tsx';
 
 test.describe('Pi session input controls and tool card rendering', () => {
-  test('new Pi sessions expose terminal controls and preserve the terminal tab on reload', async ({ page }) => {
+  test('new Pi sessions expose web controls and preserve chat on reload', async ({ page }) => {
     await openNewPiSession(page);
-    await expect(page.getByTestId('session-model-select')).toHaveCount(0);
-    await expect(page.getByTestId('session-depth-select')).toHaveCount(0);
-    await expect(page.getByTestId('chat-rendered-snapshot-pane')).toHaveCount(0);
+    await expect(page.getByTestId('session-model-select')).toBeVisible();
+    await expect(page.getByTestId('session-depth-select')).toBeVisible();
+    await expect(page.getByTestId('web-chat')).toBeVisible();
     await page.reload({ waitUntil: 'networkidle' });
-    await expect(page.getByTestId('tab-shell')).toHaveAttribute('aria-pressed', 'true');
-    await expect(page.getByTestId('persistent-main-terminal')).toBeVisible();
+    await expect(page.getByTestId('tab-chat')).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.getByTestId('web-chat')).toBeVisible();
   });
 
   test('Pi tool messages render commands visible with output collapsed by default and survive repeated toggles plus refresh', async ({ page }) => {
@@ -88,7 +88,7 @@ async function openNewPiSession(page) {
   await page.getByRole('button', { name: /New Session|新建/ }).click();
   await expect(page.getByTestId('project-new-session-provider-picker')).toBeVisible({ timeout: 10_000 });
   await page.getByTestId('project-new-session-provider-pi').click({ noWaitAfter: true });
-  await expect(page.getByTestId('persistent-main-terminal')).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByTestId('web-chat')).toBeVisible({ timeout: 20_000 });
   await expect(page.getByTestId('pi-model-unavailable')).toHaveCount(0, { timeout: 20_000 });
 }
 

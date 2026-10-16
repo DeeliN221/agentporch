@@ -287,6 +287,10 @@ async function ensurePiSession(session: PiSessionRecord, options: {
     ? await findPiSessionFile(options.sessionId)
     : null;
 
+  if (options.sessionId && !isAgentPorchRouteSessionId(options.sessionId) && !sessionFilePath) {
+    throw new Error('The selected Pi session file is unavailable. Reopen the original workspace before continuing.');
+  }
+
   let piSession: import('@earendil-works/pi-coding-agent').AgentSession;
 
   if (sessionFilePath) {
@@ -540,8 +544,8 @@ export async function sendNativeMessage(input: {
   providerSessionId?: string;
 }): Promise<{ accepted: boolean; queued?: boolean; providerSessionId?: string }> {
   const { provider, sessionId, projectPath, text, runningBehavior, writer, clientRequestId } = input;
-  if (provider !== 'codex') {
-    /** Pi and Claude execution are external tmux TUI concerns, never SDK/RPC fallbacks. */
+  if (provider !== 'codex' && provider !== 'pi') {
+    /** Only providers with a structured web runtime accept chat commands. */
     return { accepted: false };
   }
   const resolvedProjectPath = projectPath || process.cwd();

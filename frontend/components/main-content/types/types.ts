@@ -47,10 +47,7 @@ export type MainContentProps = {
   onNewSession: NewSessionHandler;
   onShowSettings: () => void;
   onRefresh: () => Promise<void> | void;
-  onRenderSnapshotRequest?: () => void;
-  onResolveFocusedSession?: (terminalPid: number) => Promise<ProjectSession | null>;
   externalMessageUpdate: number;
-  renderSnapshotRequestId?: number;
   headerLeadingContent?: ReactNode;
 };
 

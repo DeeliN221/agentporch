@@ -4,6 +4,7 @@
  * so fast consecutive server events are not lost between React renders.
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { ChatDeliveryClient } from './chatDeliveryClient';
 import { useAuth } from './AuthContext';
 
 export type SocketMessageEnvelope = {
@@ -17,12 +18,14 @@ type WebSocketContextType = {
   latestMessage: any | null;
   messageHistory: SocketMessageEnvelope[];
   isConnected: boolean;
+  failedMessages: any[];
+  dismissDeliveryFailure: (message: any) => void;
 };
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
 
 const MAX_QUEUED_MESSAGES = 50;
-const MAX_MESSAGE_HISTORY = 200;
+const MAX_MESSAGE_HISTORY = 10_000;
 const CHAT_RECONNECT_DELAY_MS = 3_000;
 const CHAT_HEARTBEAT_INTERVAL_MS = 15_000;
 
@@ -54,8 +57,15 @@ const useWebSocketProviderState = (): WebSocketContextType => {
   const [latestMessage, setLatestMessage] = useState<any>(null);
   const [messageHistory, setMessageHistory] = useState<SocketMessageEnvelope[]>([]);
   const [isConnected, setIsConnected] = useState(false);
+  const [deliveryVersion, setDeliveryVersion] = useState(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const { token } = useAuth();
+  const { token, user } = useAuth();
+  const deliveryOwner = String((user as { id?: string } | null)?.id || 'anonymous');
+  const deliveryRef = useRef<{owner: string; client: ChatDeliveryClient} | null>(null);
+  if (!deliveryRef.current || deliveryRef.current.owner !== deliveryOwner) {
+    deliveryRef.current = { owner: deliveryOwner, client: new ChatDeliveryClient(sessionStorage, deliveryOwner) };
+    outboundQueueRef.current = [];
+  }
 
   /**
    * Reset the websocket heartbeat timers when the socket becomes healthy or closes.
@@ -106,6 +116,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       }
 
       try {
+        for (const pending of deliveryRef.current!.client.requests()) socket.send(JSON.stringify(pending));
         socket.send(JSON.stringify({
           type: 'ping',
           timestamp: Date.now(),
@@ -128,12 +139,13 @@ const useWebSocketProviderState = (): WebSocketContextType => {
     const queued = [...outboundQueueRef.current];
     outboundQueueRef.current = [];
 
-    for (const serializedMessage of queued) {
+    for (let index = 0; index < queued.length; index++) {
+      const serializedMessage = queued[index];
       try {
         socket.send(serializedMessage);
       } catch (error) {
         // Put unsent payloads back to the front if sending fails mid-flush.
-        outboundQueueRef.current = [serializedMessage, ...outboundQueueRef.current];
+        outboundQueueRef.current = [...queued.slice(index), ...outboundQueueRef.current];
         console.error('Error flushing queued WebSocket message:', error);
         break;
       }
@@ -154,9 +166,10 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      const socket = wsRef.current;
+      wsRef.current = null;
+      isConnectingRef.current = false;
+      socket?.close();
     };
   }, [token]); // everytime token changes, we reconnect
 
@@ -180,12 +193,14 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       wsRef.current = websocket;
 
       websocket.onopen = () => {
-        if (unmountedRef.current) {
+        if (unmountedRef.current || wsRef.current !== websocket) {
           websocket.close();
           return;
         }
 
         isConnectingRef.current = false;
+        websocket.send(JSON.stringify(deliveryRef.current!.client.resumeMessage()));
+        for (const pending of deliveryRef.current!.client.requests()) websocket.send(JSON.stringify(pending));
         setIsConnected(true);
         flushOutboundQueue(websocket);
         startHeartbeat(websocket);
@@ -200,17 +215,14 @@ const useWebSocketProviderState = (): WebSocketContextType => {
           const data = JSON.parse(event.data);
           markSocketAlive();
 
+          if (!deliveryRef.current!.client.receive(data)) return;
           if (data?.type === 'pong') {
             return;
           }
 
           setLatestMessage(data);
+          const nextEnvelope: SocketMessageEnvelope = { sequence: ++messageSequenceRef.current, message: data };
           setMessageHistory((previous) => {
-            const nextEnvelope: SocketMessageEnvelope = {
-              sequence: messageSequenceRef.current + 1,
-              message: data,
-            };
-            messageSequenceRef.current = nextEnvelope.sequence;
             const nextHistory = [...previous, nextEnvelope];
             if (nextHistory.length <= MAX_MESSAGE_HISTORY) {
               return nextHistory;
@@ -256,30 +268,44 @@ const useWebSocketProviderState = (): WebSocketContextType => {
   }, [clearHeartbeatTimers, flushOutboundQueue, markSocketAlive, startHeartbeat, token]); // everytime token changes, we reconnect
 
   const sendMessage = useCallback((message: any) => {
+    deliveryRef.current!.client.remember(message);
+    if (message.type?.endsWith('-command')) setDeliveryVersion(version => version + 1);
+    const isProviderCommand = ['codex-command', 'pi-command', 'claude-command'].includes(message?.type);
     const serializedMessage = JSON.stringify(message);
     const socket = wsRef.current;
     if (socket && socket.readyState === WebSocket.OPEN) {
       console.log('[WS sendMessage] Sending:', message?.type, 'readyState:', socket.readyState);
-      socket.send(serializedMessage);
+      try {
+        socket.send(serializedMessage);
+      } catch (error) {
+        if (!isProviderCommand) throw error;
+        socket.close(); // The durable outbox retries with the same identity.
+      }
     } else {
       console.warn('[WS sendMessage] Socket not ready, queuing:', message?.type,
         'readyState:', socket?.readyState, 'queueLen:', outboundQueueRef.current.length);
-      if (outboundQueueRef.current.length >= MAX_QUEUED_MESSAGES) {
-        outboundQueueRef.current.shift();
+      if (!isProviderCommand) {
+        if (outboundQueueRef.current.length >= MAX_QUEUED_MESSAGES) throw new Error('The offline command queue is full.');
+        outboundQueueRef.current.push(serializedMessage);
       }
-      outboundQueueRef.current.push(serializedMessage);
       connect();
     }
   }, [connect]);
 
+  const dismissDeliveryFailure = useCallback((message: any) => {
+    deliveryRef.current!.client.dismissFailure(message);
+    setDeliveryVersion(version => version + 1);
+  }, []);
   const value: WebSocketContextType = useMemo(() =>
   ({
     ws: wsRef.current,
     sendMessage,
     latestMessage,
     messageHistory,
-    isConnected
-  }), [sendMessage, latestMessage, messageHistory, isConnected]);
+    isConnected,
+    failedMessages: deliveryRef.current!.client.failures(),
+    dismissDeliveryFailure,
+  }), [sendMessage, latestMessage, messageHistory, isConnected, deliveryVersion, dismissDeliveryFailure, deliveryOwner]);
 
   return value;
 };

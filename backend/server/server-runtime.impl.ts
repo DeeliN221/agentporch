@@ -164,6 +164,7 @@ import { createRuntimeWriterAdapter } from './realtime/runtime-writer-adapter.js
 import { createSessionSubscriptionRegistry } from './realtime/session-subscription-registry.js';
 import { createServerRuntimeContext, type ServerRuntimeContext } from './server-runtime-context.js';
 import { closeShellPtySessions } from './shell-websocket.js';
+import { closeClaudeSessions } from '../domains/provider-runtime/claude-cli-runtime.js';
 import { printStartupBanner } from './startup-banner.js';
 import { formatFirstRunFailureHint, printFirstRunNotice } from './first-run-notice.js';
 import { createWebSocketGateway } from './websocket-gateway.js';
@@ -522,32 +523,6 @@ const WATCHER_IGNORED_PATTERNS = [
 ];
 const connectedClients = new Set<WebSocket>();
 const chatClientUsers = new WeakMap<object, string | null>();
-const recentChatRequestIds = new Map<string, number>();
-const CHAT_REQUEST_ID_TTL_MS = 10 * 60 * 1000;
-
-function pruneRecentChatRequestIds(now = Date.now()) {
-    for (const [requestId, expiresAt] of recentChatRequestIds.entries()) {
-        if (expiresAt <= now) {
-            recentChatRequestIds.delete(requestId);
-        }
-    }
-}
-
-function acceptChatRequestId(requestId: unknown): boolean {
-    if (typeof requestId !== 'string' || !requestId) {
-        return true;
-    }
-
-    const now = Date.now();
-    pruneRecentChatRequestIds(now);
-
-    if (recentChatRequestIds.has(requestId)) {
-        return false;
-    }
-
-    recentChatRequestIds.set(requestId, now + CHAT_REQUEST_ID_TTL_MS);
-    return true;
-}
 let isGetProjectsRunning = false; // Flag to prevent reentrant calls
 let isShuttingDown = false;
 
@@ -668,7 +643,6 @@ const ptySessionsMap = new Map();
 const runtimeContext: ServerRuntimeContext = createServerRuntimeContext({
     connectedClients,
     chatClientUsers,
-    recentChatRequestIds,
     pendingProjectListInvalidations,
     ptySessionsMap,
 });
@@ -850,7 +824,6 @@ const chatWebSocketDeps = {
     getManualSessionRouteRuntime,
     initManualSessionRoute,
     updateManualSessionTitleFromFirstRequest,
-    acceptChatRequestId,
     resolveChatProjectOptions,
     extractProjectDirectory,
     resolveAgentPorchSessionStartContext,
@@ -1011,6 +984,7 @@ async function shutdownServer(signal = 'SIGTERM') {
     await closeProjectsWatchers();
     await closeGoRunnerWatchers();
     closePtySessions();
+    await closeClaudeSessions();
     await closeWebSocketServer();
 
     await new Promise<void>((resolve, reject) => {

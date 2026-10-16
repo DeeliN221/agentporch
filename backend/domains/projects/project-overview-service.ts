@@ -130,7 +130,8 @@ export async function getPiSessions(projectPath: unknown = '', options: LooseRec
 
 /** Read Claude session headers from the shared indexed provider read model. */
 export async function getClaudeSessions(projectPath: unknown = '', options: LooseRecord = {}): Promise<LooseRecord[]> {
-  return readProviderSessions('claude', String(projectPath || ''), options);
+  const sessions = await readProviderSessions('claude', String(projectPath || ''), options);
+  return mergeProviderSessionsWithRoutes('claude', String(projectPath || ''), sessions, options);
 }
 
 /** Read Claude history from its indexed transcript path. */
@@ -364,7 +365,7 @@ function mergeProviderSessionHeaders(indexedSessions: LooseRecord[], scannedSess
  * Merge provider sessions with manual cN route records from config.
  */
 async function mergeProviderSessionsWithRoutes(
-  provider: 'codex' | 'pi',
+  provider: 'codex' | 'pi' | 'claude',
   projectPath: string,
   providerSessions: LooseRecord[],
   options: LooseRecord,
@@ -517,7 +518,7 @@ function isWorkflowOwnedProviderSession(session: LooseRecord, workflowOwnedSessi
  * back into the SQLite read model.
  */
 async function markWorkflowOwnedProviderSessions(
-  provider: 'codex' | 'pi',
+  provider: 'codex' | 'pi' | 'claude',
   providerSessions: LooseRecord[],
   workflowOwnedSessionIds: Set<string>,
 ): Promise<LooseRecord[]> {
@@ -550,7 +551,7 @@ async function markWorkflowOwnedProviderSessions(
  * Collect provider-scoped workflow-owned session ids from project-local config.
  */
 function collectConfigWorkflowOwnedProviderSessionIds(
-  provider: 'codex' | 'pi',
+  provider: 'codex' | 'pi' | 'claude',
   config: LooseRecord,
 ): Set<string> {
   const sessionIds = new Set<string>();
@@ -597,7 +598,7 @@ function collectConfigWorkflowOwnedProviderSessionIds(
  */
 async function collectWorkflowOwnedProviderSessionIds(
   projectPath: string,
-  provider: 'codex' | 'pi',
+  provider: 'codex' | 'pi' | 'claude',
   config: LooseRecord,
 ): Promise<Set<string>> {
   const sessionIds = collectConfigWorkflowOwnedProviderSessionIds(provider, config);

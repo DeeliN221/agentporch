@@ -14,5 +14,6 @@ export default {
   testMatch: [
     'project-visibility.spec.ts',
     'pi-provider-business-flow.spec.ts',
+    'chat-delivery.spec.ts',
   ],
 };

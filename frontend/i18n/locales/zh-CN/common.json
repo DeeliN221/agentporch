@@ -20,8 +20,8 @@
   "tabs": {
     "overview": "主页",
     "workflows": "工作流",
-    "chat": "渲染",
-    "rendering": "正在渲染",
+    "chat": "聊天",
+    "rendering": "加载聊天",
     "shell": "终端",
     "files": "文件"
   },

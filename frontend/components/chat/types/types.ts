@@ -12,6 +12,7 @@ export type Provider = SessionProvider;
 export type PermissionMode = 'bypassPermissions';
 
 export interface ChatAttachment {
+  originalName?: string;
   absolutePath?: string;
   kind?: 'file' | 'directory';
   mimeType?: string;

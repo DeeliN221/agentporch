@@ -13,18 +13,18 @@ import {
   type ClipboardImageReader,
 } from '../../frontend/components/chat/tui/clipboardImageFiles.ts';
 
-test('TUI 顶栏接入剪贴板按钮和Terminal路径插入链路', () => {
-  /** Guard the user-visible button and its reuse of the existing upload flow. */
+test('Web chat owns attachments independently of terminal input', () => {
+  // File uploads belong to the composer and must never inject terminal keys.
   const source = fs.readFileSync(
-    path.join(process.cwd(), 'frontend/components/chat/view/ChatInterface.tsx'),
-    'utf8',
+    path.join(process.cwd(), 'frontend/components/chat/view/ChatInterface.tsx'), 'utf8',
   );
-
-  assert.match(source, /chat-tui-paste-clipboard-image-button/);
-  assert.match(source, /readClipboardImageFiles\(clipboard\)/);
-  assert.match(source, /handleTuiAttachmentUpload\(imageFiles\)/);
-  assert.match(source, /onTerminalPaste=\{handleTuiTerminalPaste\}/);
-  assert.match(source, /tuiTerminalInputRef\.current\?\.\(insertion\)/);
+  const composer = fs.readFileSync(
+    path.join(process.cwd(), 'frontend/components/chat/view/subcomponents/ChatComposer.tsx'), 'utf8',
+  );
+  assert.match(source, /<ChatComposer/);
+  assert.match(source, /onSubmit=\{composer.handleSubmit\}/);
+  assert.match(composer, /onPaste=\{onTextareaPaste\}/);
+  assert.doesNotMatch(source, /tuiTerminalInputRef|handleTuiAttachmentUpload|onTerminalPaste/);
 });
 
 test('Ctrl+V 从原生 paste 事件读取图片，不依赖安全上下文剪贴板 API', () => {

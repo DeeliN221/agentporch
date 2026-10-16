@@ -535,12 +535,12 @@ export function useProjectsState({
       setSelectedProject(projectWithSyntheticSession);
       setSelectedSession(syntheticSession);
       setSelectedWorkflow(null);
-      // New sessions retain the live terminal entry point; stored history opens in chat.
-      setActiveTab('shell');
+      // New and existing conversations use the same web chat entry point.
+      setActiveTab('chat');
       const baseRoute = targetWorkflow
         ? buildWorkflowChildSessionRoute(projectWithSyntheticSession, targetWorkflow, syntheticSession)
         : buildProjectSessionRoute(projectWithSyntheticSession, syntheticSession);
-      const newSessionParams = new URLSearchParams({ tab: 'shell' });
+      const newSessionParams = new URLSearchParams({ tab: 'chat' });
       if (provider !== 'codex') {
         newSessionParams.set('provider', provider);
       }

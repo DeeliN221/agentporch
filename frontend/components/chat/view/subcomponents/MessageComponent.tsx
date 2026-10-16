@@ -11,7 +11,6 @@ import { formatUsageLimitText } from '../../utils/chatFormatting';
 import type { Project } from '../../../../types/app';
 import { ToolRenderer, shouldHideToolResult } from '../../tools';
 import { trimOuterBlankLines } from '../../utils/toolTextNormalization';
-import { formatPathRelativeToProject } from '../../../../utils/pathDisplay';
 
 /**
  * Identify realtime-only tool cards whose result has not converged through
@@ -186,7 +185,6 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
   const isCompletedTaskNotification = message.taskStatus === 'completed';
   const isGoalCompletionNotification = isCompletedTaskNotification && message.taskKind === 'goal_complete';
   const completedTaskDuration = useMemo(() => formatTaskDurationMs(message.durationMs), [message.durationMs]);
-  const selectedProjectRoot = selectedProject?.fullPath || selectedProject?.path || '';
   const hideAssistantMetadata = Boolean(suppressAssistantMetadata) || isCodexLiveAssistant(message) || (isToolCard && isLiveToolSource(message.source));
 
   return (
@@ -207,15 +205,14 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
               <div className="mt-2 space-y-2">
                 {messageAttachments.map((attachment, idx) => {
                   const attachmentPath = attachment.absolutePath || attachment.relativePath || attachment.name;
-                  const displayAttachmentPath = formatPathRelativeToProject(attachmentPath, selectedProjectRoot);
 
                   return (
                     <div
                       key={`${attachmentPath}-${idx}`}
                       className={`rounded-lg px-3 py-2 text-xs ${userStyles.attachment}`}
                     >
-                      <div className="font-medium">{attachment.relativePath || attachment.name}</div>
-                      <div className={`break-all ${userStyles.meta}`}>{displayAttachmentPath}</div>
+                      <div className="font-medium">{attachment.originalName || attachment.relativePath || attachment.name}</div>
+                      <div className={`break-all ${userStyles.meta}`}>{attachment.mimeType || 'File'}</div>
                     </div>
                   );
                 })}

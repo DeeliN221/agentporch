@@ -10,8 +10,8 @@ export interface ComposerDraftSnapshot {
 /**
  * Build the localStorage key used for a project's draft composer text.
  */
-export function getComposerDraftStorageKey(projectName: string): string {
-  return `draft_input_${projectName}`;
+export function getComposerDraftStorageKey(projectName: string, sessionId?: string, provider?: string): string {
+  return sessionId ? `draft_input_${JSON.stringify([projectName, provider || '', sessionId])}` : `draft_input_${projectName}`;
 }
 
 /**

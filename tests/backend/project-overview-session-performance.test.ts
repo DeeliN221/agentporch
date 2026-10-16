@@ -20,6 +20,7 @@ async function withTemporaryHome(testBody) {
    * developer's actual Codex/Pi histories during the regression test.
    */
   const originalHome = process.env.HOME;
+  const originalHermesHome = process.env.HERMES_HOME;
   const originalXdgStateHome = process.env.XDG_STATE_HOME;
   const originalDatabasePath = process.env.DATABASE_PATH;
   const originalPath = process.env.PATH;
@@ -27,11 +28,14 @@ async function withTemporaryHome(testBody) {
   const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentporch-overview-sessions-'));
 
   process.env.HOME = homeDir;
+  process.env.HERMES_HOME = path.join(homeDir, '.hermes');
   process.env.XDG_STATE_HOME = path.join(homeDir, '.local', 'state');
   process.env.DATABASE_PATH = path.join(homeDir, 'auth.db');
   try {
     await testBody(homeDir);
   } finally {
+    if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = originalHermesHome;
     if (originalHome) {
       process.env.HOME = originalHome;
     } else {

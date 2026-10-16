@@ -35,8 +35,13 @@ async function spawnAgentPorchServer(binDir, coHome, databasePath) {
   return startIsolatedBackendServer({
     cwd: AGENTPORCH_ROOT,
     databasePath,
+    healthTimeoutMs: 60_000,
     env: {
+      HOME: path.dirname(databasePath),
+      USERPROFILE: path.dirname(databasePath),
+      HERMES_HOME: path.join(path.dirname(databasePath), '.hermes'),
       AGENTPORCH_CO_HOME: coHome,
+      AGENTPORCH_FAKE_PI_RUNTIME: '1',
       PATH: `${binDir}:${process.env.PATH || ''}`,
     },
   });
@@ -64,7 +69,7 @@ async function setupRequestDirs(coHome) {
 // Test: Pi send through pi-command WebSocket path (native runtime)
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('pi-command redirects users to the tmux TUI without co writes', async () => {
+test('pi-command accepts web input through the native runtime without co writes', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentporch-pi-send-'));
   const coHome = path.join(tempRoot, 'co');
   const binDir = path.join(tempRoot, 'bin');
@@ -96,8 +101,11 @@ test('pi-command redirects users to the tmux TUI without co writes', async () =>
       },
     }));
 
-    // Wait for the protocol-level TUI response.
-    await new Promise((r) => setTimeout(r, 500));
+    // Wait for acceptance or an explicit provider failure, not an arbitrary delay.
+    const deadline = Date.now() + 15_000;
+    while (!messages.some(message => ['message-accepted', 'pi-error', 'error'].includes(message.type)) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
 
     // Verify no co-request-v1 pending requests were written
     const pendingDir = path.join(coHome, 'requests', 'pending');
@@ -108,9 +116,8 @@ test('pi-command redirects users to the tmux TUI without co writes', async () =>
     assert.equal(pendingFiles.length, 0,
       `must not write any co-request-v1 pending requests (native runtime, not co). Server: ${fixture.output.text.slice(-400)}`);
 
-    const tuiRedirect = messages.find((message) => message.type === 'pi-error');
-    assert.equal(tuiRedirect?.error, 'Pi supports only the tmux TUI');
-    assert.equal(messages.some((message) => message.type === 'message-accepted'), false);
+    assert.equal(messages.some((message) => message.type === 'pi-error'), false);
+    assert.equal(messages.some((message) => message.type === 'message-accepted'), true, JSON.stringify(messages));
 
     ws.close();
   } finally {
@@ -156,8 +163,11 @@ test('abort-session with provider=pi handles accepted and rejected native starts
       },
     }));
 
-    // Wait for the session to start and enter running state
-    await new Promise((r) => setTimeout(r, 3000));
+    // Wait for the actual admission result, then abort while the fake turn is running.
+    const admissionDeadline = Date.now() + 15_000;
+    while (!messages.some(m => ['message-accepted', 'message-rejected', 'pi-error', 'error'].includes(m.type)) && Date.now() < admissionDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
 
     const acceptedBefore = messages.find((m) => m.type === 'message-accepted');
     if (!acceptedBefore) {
@@ -181,7 +191,10 @@ test('abort-session with provider=pi handles accepted and rejected native starts
       projectPath: tempRoot,
     }));
 
-    await new Promise((r) => setTimeout(r, 1500));
+    const abortDeadline = Date.now() + 5_000;
+    while (!messages.some(m => m.type === 'session-aborted') && Date.now() < abortDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
 
     // 3. Verify session-aborted with success=true
     const abortedEvent = messages.find((m) => m.type === 'session-aborted');
