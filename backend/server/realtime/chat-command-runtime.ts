@@ -1,3 +1,5 @@
+import { db } from '../../database/db.js';
+import { createChatDeliveryStore, serializeChatAdmission, type DeliveryScope } from './chat-delivery-store.js';
 import { sendClaudeMessage, abortClaudeSession, getClaudeSessionStatus, getActiveClaudeSessions } from '../../domains/provider-runtime/claude-cli-runtime.js';
 /**
  * Define chat WebSocket connection handling.
@@ -19,6 +21,8 @@ import {
 import { dispatchChatCommand as routeChatCommand } from './chat-command-router.js';
 
 type LooseRecord = Record<string, any>;
+
+const deliveryStore = createChatDeliveryStore(db);
 
 const chatClientScopes = createChatClientScopeStore();
 
@@ -48,6 +52,7 @@ function rememberChatClientScope(ws: WebSocket, scope: LooseRecord, userId: stri
 
     const existingScopes = chatClientScopes.get(ws);
     const nextScopes = existingScopes.filter((existing) => {
+        if (existing.userId !== normalized.userId || existing.projectPath !== normalized.projectPath || existing.provider !== normalized.provider) return true;
         if (normalized.agentporchSessionId && existing.agentporchSessionId === normalized.agentporchSessionId) {
             return false;
         }
@@ -71,13 +76,13 @@ function chatClientScopeMatches(eventScope: ChatClientScope, targetScope: ChatCl
      * PURPOSE: Match by stable session identity first, with request id as a
      * fallback for events emitted before the provider session is finalized.
      */
-    if (eventScope.userId !== null && targetScope.userId !== eventScope.userId) {
+    if (targetScope.userId !== eventScope.userId) {
         return false;
     }
-    if (eventScope.projectPath && targetScope.projectPath && targetScope.projectPath !== eventScope.projectPath) {
+    if (eventScope.projectPath && targetScope.projectPath !== eventScope.projectPath) {
         return false;
     }
-    if (eventScope.provider && targetScope.provider && targetScope.provider !== eventScope.provider) {
+    if (eventScope.provider && targetScope.provider !== eventScope.provider) {
         return false;
     }
     if (eventScope.agentporchSessionId && targetScope.agentporchSessionId === eventScope.agentporchSessionId) {
@@ -111,7 +116,7 @@ export function unregisterChatClient(runtime: any, ws: WebSocket): void {
  * Create the chat protocol command dispatcher.
  */
 export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: any) {
-    const { connectedClients, chatClientUsers, broadcastChatEvent, finalizeManualSessionRoute, initManualSessionRoute, updateManualSessionTitleFromFirstRequest, acceptChatRequestId, resolveChatProjectOptions, extractProjectDirectory, resolveAgentPorchSessionStartContext, resolveAgentPorchRouteSessionIdFromProviderSession, getSessionModelState, sendNativeMessage, sendMessageAccepted, abortNativeSession, broadcastSessionModelStateUpdated, isAgentPorchRouteSessionId, normalizeManualProvider, getNativeSessionStatus, getActiveNativeSessions, createRuntimeWriterAdapter, sessionSubscriptionRegistry, broadcastProjectListInvalidated } = deps;
+    const { connectedClients, chatClientUsers, broadcastChatEvent, finalizeManualSessionRoute, initManualSessionRoute, updateManualSessionTitleFromFirstRequest, resolveChatProjectOptions, extractProjectDirectory, resolveAgentPorchSessionStartContext, resolveAgentPorchRouteSessionIdFromProviderSession, getSessionModelState, sendNativeMessage, sendMessageAccepted, abortNativeSession, broadcastSessionModelStateUpdated, isAgentPorchRouteSessionId, normalizeManualProvider, getNativeSessionStatus, getActiveNativeSessions, createRuntimeWriterAdapter, sessionSubscriptionRegistry, broadcastProjectListInvalidated } = deps;
     const adaptRuntimeWriter = typeof createRuntimeWriterAdapter === 'function'
         ? createRuntimeWriterAdapter
         : defaultCreateRuntimeWriterAdapter;
@@ -334,15 +339,16 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
         console.log('[INFO] Chat WebSocket connected');
 
         // Add to connected clients for project updates
-        registerChatClient({ connectedClients, chatClientUsers }, ws, request?.user?.id || null);
+        const sourceUserId = request?.user?.id || null;
+        registerChatClient({ connectedClients, chatClientUsers }, ws, sourceUserId);
 
         const sendToChatClients = (payload: unknown, payloadSessionId?: string | null, payloadIndexContext?: LooseRecord | null) => {
-            const sourceUserId = chatClientUsers.get(ws) || null;
             const indexContext = payloadIndexContext || writer.getSessionIndexContext();
             const payloadRecord = (payload && typeof payload === 'object') ? payload as LooseRecord : {};
-            const indexedPayload = indexContext?.agentporchSessionId
+            let indexedPayload = indexContext?.agentporchSessionId
                 ? {
                     ...payloadRecord,
+                    clientRequestId: payloadRecord.clientRequestId || indexContext.clientRequestId,
                     projectName: indexContext.projectName || payloadRecord.projectName,
                     projectPath: indexContext.projectPath || payloadRecord.projectPath,
                     provider: indexContext.provider || payloadRecord.provider,
@@ -357,7 +363,8 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                 clientRequestId: indexedPayload.clientRequestId || indexedPayload.client_request_id || indexContext?.routeInitToken,
             }, sourceUserId);
             const lifecycleProviderSessionId = resolveLifecycleProviderSessionId(payloadRecord, indexContext?.agentporchSessionId || '');
-            if (indexContext?.agentporchSessionId && lifecycleProviderSessionId) {
+            if (lifecycleProviderSessionId) indexedPayload.nativeSessionId = lifecycleProviderSessionId;
+            if (indexContext?.agentporchSessionId && isAgentPorchRouteSessionId(indexContext.agentporchSessionId) && lifecycleProviderSessionId) {
                 void (async () => {
                     await writeProviderSessionBinding({
                         projectName: indexContext.projectName || '',
@@ -389,6 +396,10 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                 return;
             }
 
+            if (privateScope.projectPath && privateScope.provider && privateScope.agentporchSessionId && indexedPayload.clientRequestId) {
+                indexedPayload = deliveryStore.append({ userId: sourceUserId, projectPath: privateScope.projectPath,
+                    provider: privateScope.provider, sessionId: privateScope.agentporchSessionId }, indexedPayload);
+            }
             const serializedPayload = JSON.stringify(indexedPayload);
             connectedClients.forEach((client: WebSocket) => {
                 if (client.readyState !== 1) {
@@ -412,17 +423,37 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
         // Wrap WebSocket with writer for consistent interface with SSEStreamWriter
         const writer = new WebSocketWriter(ws, sendToChatClients);
 
+        async function readDurableBinding(provider: 'codex' | 'pi' | 'claude', projectName: string, projectPath: string, route: string) {
+            const binding = await readProviderSessionBinding(projectName, projectPath, route);
+            if (binding && binding.provider !== provider) throw new Error('This session belongs to a different provider. Open a new session to switch agents.');
+            if (binding) return binding;
+            const nativeId = deliveryStore.binding({ userId: sourceUserId, provider, projectPath, sessionId: route });
+            if (!nativeId) return null;
+            await writeProviderSessionBinding({ projectName, projectPath, routeSessionId: route, provider, providerSessionId: nativeId });
+            return { provider, providerSessionId: nativeId };
+        }
+
         async function handleChatCommand(data: ChatInboundMessage): Promise<void> {
             /**
              * PURPOSE: Keep command branching and provider runtime calls outside the
              * WebSocket lifecycle handler while preserving the legacy command behavior.
              */
                 console.log('📨 Chat message received:', data.type);
-                if (data.type === 'codex-command') {
-                    if (!acceptChatRequestId(data.clientRequestId || data.options?.clientRequestId)) {
-                        console.warn('[DEBUG] Ignoring duplicate Codex request:', data.clientRequestId || data.options?.clientRequestId);
-                        return;
+                if (data.type === 'resume-chat') {
+                    const through = deliveryStore.head();
+                    const after = Number(data.afterEventId);
+                    if (!Number.isSafeInteger(after) || after < 0 || !Array.isArray(data.scopes) || data.scopes.length > 50) throw new Error('Invalid chat replay cursor');
+                    const events = new Map<number, any>();
+                    for (const scope of data.scopes) {
+                        if (!scope.projectPath || !scope.sessionId || !['codex', 'pi', 'claude'].includes(scope.provider)) continue;
+                        rememberChatClientScope(ws, { ...scope, agentporchSessionId: scope.sessionId }, sourceUserId);
+                        for (const event of deliveryStore.replay({ ...scope, userId: sourceUserId }, after, through)) events.set(event.deliveryEventId, event);
                     }
+                    for (const event of [...events.values()].sort((a,b) => a.deliveryEventId-b.deliveryEventId)) ws.send(JSON.stringify(event));
+                    ws.send(JSON.stringify({ type: 'chat-resumed', deliveryCursor: through }));
+                    return;
+                }
+                if (data.type === 'codex-command') {
                     const resolvedOptions = await resolveChatProjectOptions(data.options, extractProjectDirectory) as LooseRecord;
                     let {
                         agentporchSessionId,
@@ -432,7 +463,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         agentporchSessionId = await resolveAgentPorchRouteSessionIdFromProviderSession('codex', data, resolvedOptions);
                     }
                     const codexManualRuntime = agentporchSessionId
-                        ? await readProviderSessionBinding(
+                        ? await readDurableBinding('codex',
                             resolvedOptions?.projectName || data.options?.projectName || '',
                             resolvedOptions?.projectPath || resolvedOptions?.cwd || '',
                             agentporchSessionId,
@@ -453,11 +484,16 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         provider: 'codex',
                         agentporchSessionId,
                         routeInitToken,
-                    } : null;
+                        clientRequestId: data.clientRequestId || data.options?.clientRequestId,
+                    } : {
+                        projectName: resolvedOptions.projectName || '', projectPath: resolvedOptions.projectPath || resolvedOptions.cwd || '',
+                        provider: 'codex', agentporchSessionId: data.sessionId || resolvedOptions.sessionId,
+                        routeInitToken: '', clientRequestId: data.clientRequestId || data.options?.clientRequestId,
+                    };
                     if (codexSessionIndexContext) {
                         rememberChatClientScope(ws, {
                             ...codexSessionIndexContext,
-                            clientRequestId: routeInitToken || data.clientRequestId || data.options?.clientRequestId || '',
+                            clientRequestId: data.clientRequestId || data.options?.clientRequestId || routeInitToken || '',
                             providerSessionId: codexManualRuntime?.providerSessionId || '',
                         }, chatClientUsers.get(ws) || null);
                     }
@@ -472,7 +508,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                             'codex',
                         );
                         if (!startResult.started && startResult.reason !== 'already-started') {
-                            writer.send({
+                            codexRuntimeWriter.send({
                                 type: 'session-start-rejected',
                                 sessionId: agentporchSessionId,
                                 agentporchSessionId,
@@ -523,7 +559,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         serviceTier: codexOptions?.serviceTier || '',
                         reasoningEffort: codexOptions?.reasoningEffort || '',
                         permissionMode: codexOptions?.permissionMode || '',
-                        clientRequestId: routeInitToken || data.clientRequestId || null,
+                        clientRequestId: data.clientRequestId || data.options?.clientRequestId || routeInitToken || null,
                         turnAnchorKey: data.turnAnchorKey || data.options?.turnAnchorKey || '',
                         writer: codexRuntimeWriter,
                     });
@@ -541,10 +577,6 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                     // message-accepted / steer-rejected / codex-error through the
                     // writer.  Do NOT duplicate accepted sends here.
                 } else if (data.type === 'pi-command') {
-                    if (!acceptChatRequestId(data.clientRequestId || data.options?.clientRequestId)) {
-                        console.warn('[DEBUG] Ignoring duplicate Pi request:', data.clientRequestId || data.options?.clientRequestId);
-                        return;
-                    }
                     const resolvedOptions = await resolveChatProjectOptions(data.options, extractProjectDirectory) as LooseRecord;
                     let {
                         agentporchSessionId,
@@ -554,7 +586,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         agentporchSessionId = await resolveAgentPorchRouteSessionIdFromProviderSession('pi', data, resolvedOptions);
                     }
                     const piManualRuntime = agentporchSessionId
-                        ? await readProviderSessionBinding(
+                        ? await readDurableBinding('pi',
                             resolvedOptions?.projectName || data.options?.projectName || '',
                             resolvedOptions?.projectPath || resolvedOptions?.cwd || '',
                             agentporchSessionId,
@@ -578,11 +610,16 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         provider: 'pi',
                         agentporchSessionId,
                         routeInitToken,
-                    } : null;
+                        clientRequestId: data.clientRequestId || data.options?.clientRequestId,
+                    } : {
+                        projectName: resolvedOptions.projectName || '', projectPath: resolvedOptions.projectPath || resolvedOptions.cwd || '',
+                        provider: 'pi', agentporchSessionId: data.sessionId || resolvedOptions.sessionId,
+                        routeInitToken: '', clientRequestId: data.clientRequestId || data.options?.clientRequestId,
+                    };
                     if (piSessionIndexContext) {
                         rememberChatClientScope(ws, {
                             ...piSessionIndexContext,
-                            clientRequestId: routeInitToken || data.clientRequestId || data.options?.clientRequestId || '',
+                            clientRequestId: data.clientRequestId || data.options?.clientRequestId || routeInitToken || '',
                             providerSessionId: piManualRuntime?.providerSessionId || '',
                         }, chatClientUsers.get(ws) || null);
                     }
@@ -597,7 +634,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                             'pi',
                         );
                         if (!startResult.started && startResult.reason !== 'already-started') {
-                            writer.send({
+                            piRuntimeWriter.send({
                                 type: 'session-start-rejected',
                                 sessionId: agentporchSessionId,
                                 agentporchSessionId,
@@ -634,7 +671,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         model: piProviderOptions?.model || data.options?.model || '',
                         thinkingLevel: piProviderOptions?.thinkingLevel || data.options?.thinkingLevel || '',
                         permissionMode: piProviderOptions?.permissionMode || '',
-                        clientRequestId: routeInitToken || data.clientRequestId || null,
+                        clientRequestId: data.clientRequestId || data.options?.clientRequestId || routeInitToken || null,
                         turnAnchorKey: data.turnAnchorKey || data.options?.turnAnchorKey || '',
                         writer: piRuntimeWriter,
                     });
@@ -654,10 +691,6 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                     // also reported by the runtime via pi-error through the
                     // writer.  Do NOT duplicate error/accepted sends here.
                 } else if (data.type === 'claude-command') {
-                    if (!acceptChatRequestId(data.clientRequestId || data.options?.clientRequestId)) {
-                        console.warn('[DEBUG] Ignoring duplicate Claude request:', data.clientRequestId || data.options?.clientRequestId);
-                        return;
-                    }
                     const resolvedOptions = await resolveChatProjectOptions(data.options, extractProjectDirectory) as LooseRecord;
                     let {
                         agentporchSessionId,
@@ -667,7 +700,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         agentporchSessionId = await resolveAgentPorchRouteSessionIdFromProviderSession('claude', data, resolvedOptions);
                     }
                     const claudeManualRuntime = agentporchSessionId
-                        ? await readProviderSessionBinding(
+                        ? await readDurableBinding('claude',
                             resolvedOptions?.projectName || data.options?.projectName || '',
                             resolvedOptions?.projectPath || resolvedOptions?.cwd || '',
                             agentporchSessionId,
@@ -688,11 +721,16 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         provider: 'claude',
                         agentporchSessionId,
                         routeInitToken,
-                    } : null;
+                        clientRequestId: data.clientRequestId || data.options?.clientRequestId,
+                    } : {
+                        projectName: resolvedOptions.projectName || '', projectPath: resolvedOptions.projectPath || resolvedOptions.cwd || '',
+                        provider: 'claude', agentporchSessionId: data.sessionId || resolvedOptions.sessionId,
+                        routeInitToken: '', clientRequestId: data.clientRequestId || data.options?.clientRequestId,
+                    };
                     if (claudeSessionIndexContext) {
                         rememberChatClientScope(ws, {
                             ...claudeSessionIndexContext,
-                            clientRequestId: routeInitToken || data.clientRequestId || data.options?.clientRequestId || '',
+                            clientRequestId: data.clientRequestId || data.options?.clientRequestId || routeInitToken || '',
                             providerSessionId: claudeManualRuntime?.providerSessionId || '',
                         }, chatClientUsers.get(ws) || null);
                     }
@@ -707,7 +745,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                             'claude',
                         );
                         if (!startResult.started && startResult.reason !== 'already-started') {
-                            writer.send({
+                            claudeRuntimeWriter.send({
                                 type: 'session-start-rejected',
                                 sessionId: agentporchSessionId,
                                 agentporchSessionId,
@@ -736,8 +774,17 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         providerSessionId: claudeManualRuntime?.providerSessionId || (isAgentPorchRouteSessionId(effectiveSessionId) ? '' : effectiveSessionId) || '',
                         projectPath: claudeProviderOptions?.projectPath || claudeProviderOptions?.cwd || '',
                         text: claudePromptText,
-                        clientRequestId: routeInitToken || data.clientRequestId || null,
+                        clientRequestId: data.clientRequestId || data.options?.clientRequestId || routeInitToken || null,
                         writer: claudeRuntimeWriter,
+                        onSessionReady: async (providerSessionId) => {
+                            if (!agentporchSessionId) return;
+                            await writeProviderSessionBinding({ projectName: claudeSessionIndexContext?.projectName || '',
+                                projectPath: claudeSessionIndexContext?.projectPath || '', routeSessionId: agentporchSessionId,
+                                provider: 'claude', providerSessionId });
+                            await finalizeAgentPorchRouteSession({ ...claudeSessionIndexContext, agentporchSessionId,
+                                projectName: claudeSessionIndexContext?.projectName || '', projectPath: claudeSessionIndexContext?.projectPath || '',
+                                provider: 'claude', routeInitToken, providerSessionId });
+                        },
                     });
                     // The adapter owns lifecycle acknowledgements and errors.
                 } else if (data.type === 'abort-session') {
@@ -833,6 +880,11 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
             }
             writer.send({
                 type: errorType,
+                clientRequestId: data?.clientRequestId || data?.options?.clientRequestId,
+                agentporchSessionId: data?.agentporchSessionId || data?.options?.agentporchSessionId,
+                sessionId: data?.sessionId,
+                provider: String(data?.type || '').replace('-command', ''),
+                projectPath: data?.options?.projectPath || data?.options?.cwd || '',
                 error: error.message
             });
         }
@@ -846,12 +898,50 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
             unregisterChatClient({ connectedClients, chatClientUsers }, ws);
         }
 
+        let admissionQueue = Promise.resolve();
         return {
             dispatchChatCommand(data: ChatInboundMessage): void {
                 routeChatCommand((message) => {
-                    void handleChatCommand(message as ChatInboundMessage).catch(error => {
-                        sendProtocolError(message as ChatInboundMessage, error);
-                    });
+                    const command = message as ChatInboundMessage;
+                    if (!['codex-command', 'pi-command', 'claude-command'].includes(String(command.type))) {
+                        void handleChatCommand(command).catch(error => sendProtocolError(command, error));
+                        return;
+                    }
+                    admissionQueue = admissionQueue.catch(() => {}).then(async () => {
+                        const provider = String(command.type).replace('-command', '');
+                        const options = await resolveChatProjectOptions(command.options, extractProjectDirectory) as LooseRecord;
+                        const start = resolveAgentPorchSessionStartContext(command, options);
+                        const sessionId = start.agentporchSessionId || await resolveAgentPorchRouteSessionIdFromProviderSession(provider, command, options) || command.sessionId || options.sessionId;
+                        const clientRequestId = command.clientRequestId || options.clientRequestId;
+                        if (!sessionId || typeof clientRequestId !== 'string' || !clientRequestId || clientRequestId.length > 200) throw new Error('A stable session and request ID are required. Refresh the page before sending.');
+                        const scope: DeliveryScope = { userId: sourceUserId, projectPath: options.projectPath || options.cwd || '', provider, sessionId };
+                        if (!scope.projectPath) throw new Error('A project path is required.');
+                        const context = { ...scope, agentporchSessionId: sessionId, clientRequestId };
+                        rememberChatClientScope(ws, context, sourceUserId);
+                        const claimed = deliveryStore.claim(scope, clientRequestId, {
+                            command: command.command || '', attachments: options.attachments || [],
+                            runningBehavior: options.runningBehavior || '', model: options.model || '',
+                            permissionMode: options.permissionMode || '', reasoningEffort: options.reasoningEffort || '',
+                            serviceTier: options.serviceTier || '', thinkingLevel: options.thinkingLevel || '',
+                        });
+                        if (claimed.kind !== 'new') {
+                            if (claimed.kind === 'duplicate') {
+                                if (claimed.receipt && ws.readyState === 1) ws.send(JSON.stringify({ ...claimed.receipt, deliveryEventId: undefined }));
+                            } else {
+                                const reject = { type: 'message-rejected', ...context, clientRequestId, reason: claimed.kind,
+                                    originalCommand: claimed.kind === 'uncertain' ? claimed.originalCommand : command.command,
+                                    error: claimed.kind === 'conflict' ? 'This request ID was already used for a different message.' : 'The server restarted before delivery was confirmed. Check conversation history before sending again; this message was not automatically rerun.' };
+                                // A conflicting payload must not overwrite the original request's receipt.
+                                if (claimed.kind === 'conflict') { if (ws.readyState === 1) ws.send(JSON.stringify(reject)); }
+                                else sendToChatClients(reject, sessionId, context);
+                            }
+                            return;
+                        }
+                        await serializeChatAdmission(scope, async () => {
+                            try { await handleChatCommand({ ...command, clientRequestId, options }); }
+                            catch (error: any) { sendToChatClients({ type: 'message-rejected', clientRequestId, reason: 'admission-failed', originalCommand: command.command, error: error.message }, sessionId, context); }
+                        });
+                    }).catch(error => sendProtocolError(command, error));
                 }, data);
             },
             sendProtocolError,

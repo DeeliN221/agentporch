@@ -15,3 +15,5 @@
 Actual local browser screenshots using synthetic projects and messages. The terminal output, Pi model, and Claude CLI are test fixtures; these images do not demonstrate a live model connection. No screenshot pixels were edited.
 
 Conversations use Codex app-server, the Pi SDK, or Claude Code print/stream-json. The optional tmux project shell is independent of chat identity. Imported Hermes histories are read-only.
+
+Delivery behavior and failure boundaries are documented in [Web chat delivery](delivery.md).

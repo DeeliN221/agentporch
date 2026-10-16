@@ -37,9 +37,10 @@ export function createSessionSubscriptionRegistry(deps: any = {}) {
              * identity. User/provider are only filters; they are not sufficient
              * ownership proof for Codex/Pi deltas.
              */
-            if (session.userId && scope.userId !== session.userId) {
+            if (scope.userId !== session.userId) {
                 return false;
             }
+            if (session.projectPath && scope.projectPath !== session.projectPath) return false;
             if (session.provider && scope.provider !== session.provider) {
                 return false;
             }

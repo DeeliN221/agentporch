@@ -18,7 +18,6 @@ export type PtySessionRecord = {
 export type ServerRuntimeContext = {
     connectedClients: Set<WebSocket>;
     chatClientUsers: WeakMap<object, string | null>;
-    recentChatRequestIds: Map<string, number>;
     pendingProjectListInvalidations: Map<string, NodeJS.Timeout>;
     ptySessionsMap: Map<string, PtySessionRecord>;
 };
@@ -26,7 +25,6 @@ export type ServerRuntimeContext = {
 export type CreateServerRuntimeContextOptions = {
     connectedClients: Set<WebSocket>;
     chatClientUsers: WeakMap<object, string | null>;
-    recentChatRequestIds: Map<string, number>;
     pendingProjectListInvalidations: Map<string, NodeJS.Timeout>;
     ptySessionsMap: Map<string, PtySessionRecord>;
 };
@@ -38,7 +36,6 @@ export function createServerRuntimeContext(options: CreateServerRuntimeContextOp
     return {
         connectedClients: options.connectedClients,
         chatClientUsers: options.chatClientUsers,
-        recentChatRequestIds: options.recentChatRequestIds,
         pendingProjectListInvalidations: options.pendingProjectListInvalidations,
         ptySessionsMap: options.ptySessionsMap,
     };

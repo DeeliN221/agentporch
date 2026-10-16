@@ -27,6 +27,7 @@ process.stdin.on('data', c => text += c);
 process.stdin.on('end', () => {
  fs.appendFileSync('calls.jsonl', JSON.stringify({args,text,environmentMarker:process.env.CLAUDE_TEST_MARKER})+'\\n');
  const send = x => console.log(JSON.stringify(x));
+ if(text === 'before-init') { process.exitCode=1; return; }
  send({type:'system',subtype:'init',session_id:id});
  if(text === 'malformed') { console.log('not-json'); return; }
  if(text === 'silent') return;
@@ -74,9 +75,12 @@ process.stdin.on('end', () => {
       assert.ok(events.some(e=>e.type==='claude-error'));
       assert.equal(getClaudeSessionStatus('c1',dir).isProcessing,false);
     }
+    events.length=0;
+    assert.equal((await send('before-init')).accepted,false);
+    assert.ok(!events.some(e=>e.type==='message-accepted'));
     assert.equal((await send('invalid resume','c3','--unexpected-flag')).accepted,false);
     const calls=(await readFile(path.join(dir,'calls.jsonl'),'utf8')).trim().split('\n').map(l=>JSON.parse(l));
-    assert.equal(calls.length,5);
+    assert.equal(calls.length,6);
     assert.equal(calls[0].environmentMarker,'fixture-loaded');
     assert.equal(calls[0].text,'first $(literal)');
     assert.ok(calls[1].args.includes('--resume'));

@@ -761,6 +761,9 @@ export function ensurePlaywrightFixture(options = {}) {
     fs.rmSync(FIXTURE_STATE_HOME, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
   fs.mkdirSync(FIXTURE_ROOT, { recursive: true });
+  // The fixture CLI owns the protocol; no production daemon is contacted.
+  fs.mkdirSync(path.join(FIXTURE_ROOT, '.codex', 'app-server-control'), { recursive: true });
+  fs.writeFileSync(path.join(FIXTURE_ROOT, '.codex', 'app-server-control', 'app-server-control.sock'), 'fixture proxy endpoint');
   fs.writeFileSync(path.join(FIXTURE_ROOT, '.bashrc'), '# Playwright fixture shell startup\n', 'utf8');
   fs.writeFileSync(path.join(FIXTURE_ROOT, '.zshrc'), '# Playwright fixture shell startup\n', 'utf8');
 

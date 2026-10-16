@@ -128,6 +128,7 @@ function ensureWorkflowToolFixtures(cwd) {
     ].join('\n'),
     { mode: 0o755 },
   );
+  fs.writeFileSync(path.join(binDir, 'codex'), `#!${process.execPath}\n` + fs.readFileSync(path.join(cwd, 'tests/e2e/helpers/fake-codex-proxy.mjs'), 'utf8'), { mode: 0o755 });
   fs.writeFileSync(path.join(binDir, 'claude'), `#!${process.execPath}\n` + fs.readFileSync(path.join(cwd, 'tests/e2e/helpers/fake-claude-cli.mjs'), 'utf8'), { mode: 0o755 });
   return binDir;
 }
@@ -380,6 +381,7 @@ export default async function globalSetup() {
     AGENTPORCH_CO_HOME: process.env.AGENTPORCH_CO_HOME || path.join(cwd, '.tmp', 'playwright-co-home'),
     XDG_STATE_HOME: process.env.XDG_STATE_HOME || path.join(cwd, '.tmp', 'playwright-state-home'),
     AGENTPORCH_CLAUDE_ENV_FILE: '',
+    CODEX_HOME: path.join(process.env.HOME!, '.codex'),
     AGENTPORCH_FAKE_RUNNER: process.env.AGENTPORCH_FAKE_RUNNER || '1',
     AGENTPORCH_FAKE_RUNNER_DELAY_MS: process.env.AGENTPORCH_FAKE_RUNNER_DELAY_MS || '8000',
     AGENTPORCH_FAKE_CO_DELAY_MS: process.env.AGENTPORCH_FAKE_CO_DELAY_MS || '8000',

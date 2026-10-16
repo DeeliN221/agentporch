@@ -45,6 +45,7 @@ export async function abortClaudeSession(id: string, projectPath = '') {
 export async function sendClaudeMessage(input: {
   sessionId: string; providerSessionId?: string; projectPath: string; text: string;
   clientRequestId?: string | null; writer: RuntimeWriter;
+  onSessionReady?: (providerSessionId: string) => Promise<void>;
 }): Promise<{ accepted: boolean; providerSessionId?: string }> {
   const projectPath = path.resolve(input.projectPath || process.cwd());
   const send = (event: Record<string, unknown>) => input.writer.send({
@@ -94,8 +95,17 @@ export async function sendClaudeMessage(input: {
     : spawn(executable, args, { cwd: projectPath, env, stdio: ['pipe', 'pipe', 'pipe'] });
   session.child = child;
   let buffer = '', stderr = '', failure = '', sawResult = false, streamedText = false;
+  let accepted = false;
+  let resolveAdmission!: (value: { accepted: boolean; providerSessionId?: string }) => void;
+  const admission = new Promise<{ accepted: boolean; providerSessionId?: string }>(resolve => { resolveAdmission = resolve; });
+  const initTimeout = setTimeout(() => {
+    failure = 'Claude Code did not confirm session initialization. Check history before retrying.';
+    child.kill('SIGTERM');
+  }, 30_000);
+  initTimeout.unref();
+  let eventQueue = Promise.resolve();
   const decoder = new StringDecoder('utf8');
-  const consume = (line: string) => {
+  const consume = async (line: string) => {
     if (!line.trim()) return;
     let event: any;
     try { event = JSON.parse(line); } catch { failure = 'Claude Code returned invalid stream JSON.'; child.kill('SIGTERM'); return; }
@@ -105,8 +115,15 @@ export async function sendClaudeMessage(input: {
         failure = 'Claude Code returned a different session identity.';
         child.kill('SIGTERM'); return;
       }
+      if (accepted) return;
+      await input.onSessionReady?.(session.providerId);
       session.initialized = true;
+      accepted = true;
+      clearTimeout(initTimeout);
       send({ type: 'session-created', sessionId: session.providerId });
+      send({ type: 'message-accepted' });
+      send({ type: 'session-status', isProcessing: true, turnId: session.turnId, turnStartedAt: session.startedAt });
+      resolveAdmission({ accepted: true, providerSessionId: session.providerId });
     } else if (event.type === 'stream_event') {
       if (event.event?.type === 'message_start') streamedText = false;
       if (event.event?.type === 'content_block_delta' && event.event.delta?.text) streamedText = true;
@@ -133,29 +150,32 @@ export async function sendClaudeMessage(input: {
     if (buffer.length > 16 * 1024 * 1024) { failure = 'Claude Code stream frame exceeded the size limit.'; child.kill('SIGTERM'); return; }
     let newline: number;
     while ((newline = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); consume(line);
+      const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+      eventQueue = eventQueue.then(() => consume(line)).catch(error => { failure = error.message; child.kill('SIGTERM'); });
     }
   });
   child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8192); });
   child.stdin.on('error', error => { failure = error.message; });
   child.on('error', error => { failure = error.message; });
   child.on('close', code => {
-    buffer += decoder.end(); if (buffer.trim()) consume(buffer);
+    clearTimeout(initTimeout);
+    buffer += decoder.end();
+    eventQueue = eventQueue.then(async () => {
+    if (buffer.trim()) await consume(buffer);
+    resolveAdmission({ accepted: false });
     session.child = null;
     if (session.aborting) send({ type: 'session-aborted', success: true });
     else if (failure || code !== 0 || !sawResult) send({ type: 'claude-error', error: failure || stderr || 'Claude Code exited without a result.' });
     send({ type: 'claude-complete', actualSessionId: session.initialized ? session.providerId : '', exitCode: failure || !sawResult ? 1 : code });
     send({ type: 'session-status', isProcessing: false });
-  });
-  return new Promise(resolve => {
-    child.once('error', () => resolve({ accepted: false }));
-    child.once('spawn', () => {
-      send({ type: 'message-accepted' });
-      send({ type: 'session-status', isProcessing: true, turnId: session.turnId, turnStartedAt: session.startedAt });
-      child.stdin.end(input.text);
-      resolve({ accepted: true });
+    }).catch(error => {
+      session.child = null;
+      send({ type: 'claude-error', error: error.message });
+      resolveAdmission({ accepted: false });
     });
   });
+  child.once('spawn', () => { child.stdin.end(input.text); });
+  return admission;
 }
 
 /** Service shutdown owns child cleanup; browser disconnects never call this. */

@@ -21,6 +21,7 @@ const record = (type, content) => {
 const send = event => console.log(JSON.stringify(event));
 process.stdin.on('data', chunk => text += chunk);
 process.stdin.on('end', () => {
+  if (text === 'Reject before initialization') { console.error('Fixture initialization failed'); process.exitCode=1; return; }
   record('user', text);
   send({ type: 'system', subtype: 'init', session_id: id });
   if(text.includes('Hold this request')) { setInterval(()=>{},1000); return; }

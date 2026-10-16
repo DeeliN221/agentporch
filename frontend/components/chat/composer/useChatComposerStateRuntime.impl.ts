@@ -810,6 +810,7 @@ export function useChatComposerState({
       }
 
       if (provider === 'codex' || provider === 'pi' || provider === 'claude') {
+        try {
         sendMessage({
           type: provider === 'claude' ? 'claude-command' : provider === 'pi' ? 'pi-command' : 'codex-command',
           clientRequestId,
@@ -845,6 +846,15 @@ export function useChatComposerState({
             runningBehavior,
           },
         });
+        } catch (error) {
+          setChatMessages(previous => previous.map(message => message.clientRequestId === clientRequestId
+            ? { ...message, deliveryStatus: 'failed' as const } : message).concat({
+              type: 'error', content: error instanceof Error ? error.message : 'Unable to save the outgoing message.', timestamp: new Date(),
+            }));
+          setIsLoading(false);
+          resetComposerSubmit();
+          return;
+        }
       }
       // Do NOT re-enable abort here.  Authoritative abortability comes
       // exclusively from provider session-status events carrying an active_turn_id.

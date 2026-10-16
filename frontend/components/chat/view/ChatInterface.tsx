@@ -2,6 +2,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
+import { useWebSocket } from '../../../contexts/WebSocketContext';
 import ChatMessagesPane from './subcomponents/ChatMessagesPane';
 import ChatComposer from './subcomponents/ChatComposer';
 import ConversationBookmarks from './subcomponents/ConversationBookmarks';
@@ -20,6 +21,7 @@ function ChatInterface(props: ChatInterfaceProps) {
     onFileOpen, onShowSettings, onSessionInactive, onReplaceTemporarySession,
     onNavigateToSession, autoScrollToBottom, externalMessageUpdate } = props;
   const { t } = useTranslation('chat');
+  const { failedMessages, dismissDeliveryFailure } = useWebSocket();
   const location = useLocation();
   const pendingViewSessionRef = useRef<PendingViewSession | null>(null);
   const streamBufferRef = useRef('');
@@ -106,10 +108,27 @@ function ChatInterface(props: ChatInterfaceProps) {
     loadMessagesUntilTarget: session.loadMessagesUntilTarget, revealLoadedMessage: session.revealLoadedMessage,
   });
 
+  const selectedRoute = selectedSession?.routeIndex ? `c${selectedSession.routeIndex}` : selectedSession?.id;
+  const deliveryFailures = failedMessages.filter(message => message.provider === provider
+    && message.projectPath === (selectedSession?.projectPath || selectedProject?.fullPath || selectedProject?.path)
+    && (message.agentporchSessionId || message.sessionId) === selectedRoute);
+
   if (!selectedProject) return <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">Select a project to start chatting.</div>;
   return (
     <div className="relative flex min-h-0 flex-1 flex-col" data-testid="web-chat" data-session-id={selectedSession?.id || ''}>
       {readOnly && <div className="border-b border-border px-4 py-2 text-sm text-muted-foreground">Read-only history. Continue this session in its original workspace.</div>}
+      {deliveryFailures.length > 0 && <div className="max-h-48 shrink-0 overflow-auto border-b border-border bg-muted/40 px-4 py-3" data-testid="delivery-recovery">
+        {deliveryFailures.map(message => <div key={message.clientRequestId} role="alert" className="space-y-2 text-sm">
+          <p className="font-medium">Message needs review</p>
+          <p className="text-muted-foreground">{message.error || message.reason || 'The message could not be confirmed.'}</p>
+          <p className="whitespace-pre-wrap break-words">Original message: {message.originalCommand}</p>
+          {message.originalAttachments?.length > 0 && <p className="text-muted-foreground">Reattach files before sending again: {message.originalAttachments.map((file: any) => file.originalName || file.name || 'attachment').join(', ')}</p>}
+          <div className="flex gap-3">
+            <button type="button" className="underline" onClick={() => composer.setInput(previous => previous ? `${previous}\n\n${message.originalCommand || ''}` : message.originalCommand || '')}>Use as draft</button>
+            <button type="button" className="underline" onClick={() => dismissDeliveryFailure(message)}>Dismiss</button>
+          </div>
+        </div>)}
+      </div>}
       <ConversationBookmarks bookmarks={bookmarks} placement="floating" onBookmarkSelect={key => {
         setIsFollowingLatest(false);
         session.revealLoadedMessage(key);

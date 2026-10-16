@@ -46,10 +46,10 @@ export function markAcceptedUserMessageSent(messages: ChatMessage[], clientReque
   const exactIndex = clientRequestId
     ? messages.findIndex((message) =>
       message.type === 'user'
-      && message.deliveryStatus === 'pending'
+      && ['pending', 'sent', 'failed'].includes(message.deliveryStatus || '')
       && message.clientRequestId === clientRequestId)
     : -1;
-  const acceptedIndex = exactIndex >= 0
+  const acceptedIndex = clientRequestId
     ? exactIndex
     : (() => {
       for (let index = messages.length - 1; index >= 0; index -= 1) {

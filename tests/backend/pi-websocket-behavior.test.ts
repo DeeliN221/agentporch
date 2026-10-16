@@ -37,6 +37,9 @@ async function spawnAgentPorchServer(binDir, coHome, databasePath) {
     databasePath,
     healthTimeoutMs: 60_000,
     env: {
+      HOME: path.dirname(databasePath),
+      USERPROFILE: path.dirname(databasePath),
+      HERMES_HOME: path.join(path.dirname(databasePath), '.hermes'),
       AGENTPORCH_CO_HOME: coHome,
       AGENTPORCH_FAKE_PI_RUNTIME: '1',
       PATH: `${binDir}:${process.env.PATH || ''}`,
@@ -160,8 +163,11 @@ test('abort-session with provider=pi handles accepted and rejected native starts
       },
     }));
 
-    // Wait for the session to start and enter running state
-    await new Promise((r) => setTimeout(r, 3000));
+    // Wait for the actual admission result, then abort while the fake turn is running.
+    const admissionDeadline = Date.now() + 15_000;
+    while (!messages.some(m => ['message-accepted', 'message-rejected', 'pi-error', 'error'].includes(m.type)) && Date.now() < admissionDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
 
     const acceptedBefore = messages.find((m) => m.type === 'message-accepted');
     if (!acceptedBefore) {
@@ -185,7 +191,10 @@ test('abort-session with provider=pi handles accepted and rejected native starts
       projectPath: tempRoot,
     }));
 
-    await new Promise((r) => setTimeout(r, 1500));
+    const abortDeadline = Date.now() + 5_000;
+    while (!messages.some(m => m.type === 'session-aborted') && Date.now() < abortDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
 
     // 3. Verify session-aborted with success=true
     const abortedEvent = messages.find((m) => m.type === 'session-aborted');
