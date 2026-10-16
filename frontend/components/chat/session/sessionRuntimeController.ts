@@ -955,13 +955,7 @@ export function useChatSessionState({
 
         setCurrentSessionId(curSession.id);
 
-        if (sessionProvider === 'claude') {
-          // Claude opens in its native TUI; transcript history is fetched only
-          // when the user explicitly opens the rendered Messages tab.
-          lastHydratedSessionIdRef.current = curSession.id;
-          lastHydratedSessionViewKeyRef.current = curSessionViewKey;
-          setSessionMessages([]);
-        } else if (!isSystemSessionChange || shouldResetForSessionLoad) {
+        if (!isSystemSessionChange || shouldResetForSessionLoad) {
           const messages = await loadSessionMessages(
             sessionProjectName,
             getSessionLoadId(curSession),

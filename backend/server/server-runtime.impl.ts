@@ -164,6 +164,7 @@ import { createRuntimeWriterAdapter } from './realtime/runtime-writer-adapter.js
 import { createSessionSubscriptionRegistry } from './realtime/session-subscription-registry.js';
 import { createServerRuntimeContext, type ServerRuntimeContext } from './server-runtime-context.js';
 import { closeShellPtySessions } from './shell-websocket.js';
+import { closeClaudeSessions } from '../domains/provider-runtime/claude-cli-runtime.js';
 import { printStartupBanner } from './startup-banner.js';
 import { formatFirstRunFailureHint, printFirstRunNotice } from './first-run-notice.js';
 import { createWebSocketGateway } from './websocket-gateway.js';
@@ -1011,6 +1012,7 @@ async function shutdownServer(signal = 'SIGTERM') {
     await closeProjectsWatchers();
     await closeGoRunnerWatchers();
     closePtySessions();
+    await closeClaudeSessions();
     await closeWebSocketServer();
 
     await new Promise<void>((resolve, reject) => {

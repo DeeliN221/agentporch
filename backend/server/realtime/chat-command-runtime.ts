@@ -1,3 +1,4 @@
+import { sendClaudeMessage, abortClaudeSession, getClaudeSessionStatus, getActiveClaudeSessions } from '../../domains/provider-runtime/claude-cli-runtime.js';
 /**
  * Define chat WebSocket connection handling.
  * Keep chat protocol and provider runtime interactions separate from HTTP assembly.
@@ -240,7 +241,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
             projectName: projectName || '',
             projectPath: projectPath || '',
             routeSessionId: agentporchSessionId,
-            provider: provider === 'pi' ? 'pi' : 'codex',
+            provider: provider === 'pi' ? 'pi' : provider === 'claude' ? 'claude' : 'codex',
             providerSessionId,
         });
 
@@ -286,7 +287,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                 projectName || '',
                 projectPath || '',
                 agentporchSessionId,
-                provider === 'pi' ? 'pi' : 'codex',
+                provider === 'pi' ? 'pi' : provider === 'claude' ? 'claude' : 'codex',
                 command,
             );
             if (result?.updated && typeof broadcastProjectListInvalidated === 'function') {
@@ -312,7 +313,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
         const eventType = payload.type;
         const candidate = eventType === 'session-created'
             ? payload.sessionId
-            : eventType === 'codex-complete' || eventType === 'pi-complete'
+            : eventType === 'codex-complete' || eventType === 'pi-complete' || eventType === 'claude-complete'
                 ? payload.actualSessionId || payload.sessionId
                 : '';
         if (
@@ -362,7 +363,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         projectName: indexContext.projectName || '',
                         projectPath: indexContext.projectPath || '',
                         routeSessionId: indexContext.agentporchSessionId,
-                        provider: indexContext.provider === 'pi' ? 'pi' : 'codex',
+                        provider: indexContext.provider === 'pi' ? 'pi' : indexContext.provider === 'claude' ? 'claude' : 'codex',
                         providerSessionId: lifecycleProviderSessionId,
                     });
                     const runtime = await readProviderSessionBinding(
@@ -417,9 +418,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
              * WebSocket lifecycle handler while preserving the legacy command behavior.
              */
                 console.log('📨 Chat message received:', data.type);
-                if (data.type === 'claude-command') {
-                    writer.send({ type: 'claude-error', error: 'Provider "claude" is no longer supported' });
-                } else if (data.type === 'codex-command') {
+                if (data.type === 'codex-command') {
                     if (!acceptChatRequestId(data.clientRequestId || data.options?.clientRequestId)) {
                         console.warn('[DEBUG] Ignoring duplicate Codex request:', data.clientRequestId || data.options?.clientRequestId);
                         return;
@@ -654,7 +653,94 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                     // failure→message-rejected).  Session init failures are
                     // also reported by the runtime via pi-error through the
                     // writer.  Do NOT duplicate error/accepted sends here.
-                    } else if (data.type === 'abort-session') {
+                } else if (data.type === 'claude-command') {
+                    if (!acceptChatRequestId(data.clientRequestId || data.options?.clientRequestId)) {
+                        console.warn('[DEBUG] Ignoring duplicate Claude request:', data.clientRequestId || data.options?.clientRequestId);
+                        return;
+                    }
+                    const resolvedOptions = await resolveChatProjectOptions(data.options, extractProjectDirectory) as LooseRecord;
+                    let {
+                        agentporchSessionId,
+                        routeInitToken,
+                    } = resolveAgentPorchSessionStartContext(data, resolvedOptions);
+                    if (!agentporchSessionId) {
+                        agentporchSessionId = await resolveAgentPorchRouteSessionIdFromProviderSession('claude', data, resolvedOptions);
+                    }
+                    const claudeManualRuntime = agentporchSessionId
+                        ? await readProviderSessionBinding(
+                            resolvedOptions?.projectName || data.options?.projectName || '',
+                            resolvedOptions?.projectPath || resolvedOptions?.cwd || '',
+                            agentporchSessionId,
+                        )
+                        : null;
+                    const shouldStartAgentPorchDraft = agentporchSessionId && (
+                        !claudeManualRuntime?.providerSessionId
+                        &&
+                        (!resolvedOptions?.sessionId || isAgentPorchRouteSessionId(resolvedOptions.sessionId))
+                        && (!data.sessionId || isAgentPorchRouteSessionId(data.sessionId))
+                    );
+                    const claudeProviderOptions = shouldStartAgentPorchDraft
+                        ? { ...resolvedOptions, sessionId: undefined, resume: false }
+                        : resolvedOptions;
+                    const claudeSessionIndexContext = agentporchSessionId ? {
+                        projectName: claudeProviderOptions?.projectName || data.options?.projectName || '',
+                        projectPath: claudeProviderOptions?.projectPath || claudeProviderOptions?.cwd || '',
+                        provider: 'claude',
+                        agentporchSessionId,
+                        routeInitToken,
+                    } : null;
+                    if (claudeSessionIndexContext) {
+                        rememberChatClientScope(ws, {
+                            ...claudeSessionIndexContext,
+                            clientRequestId: routeInitToken || data.clientRequestId || data.options?.clientRequestId || '',
+                            providerSessionId: claudeManualRuntime?.providerSessionId || '',
+                        }, chatClientUsers.get(ws) || null);
+                    }
+                    const claudeRuntimeWriter = adaptRuntimeWriter(claudeSessionIndexContext
+                        ? writer.withSessionIndexContext(claudeSessionIndexContext)
+                        : writer);
+                    if (shouldStartAgentPorchDraft) {
+                        const startResult = await initManualSessionRoute(
+                            claudeProviderOptions?.projectName || data.options?.projectName || '',
+                            claudeProviderOptions?.projectPath || claudeProviderOptions?.cwd || '',
+                            agentporchSessionId,
+                            'claude',
+                        );
+                        if (!startResult.started && startResult.reason !== 'already-started') {
+                            writer.send({
+                                type: 'session-start-rejected',
+                                sessionId: agentporchSessionId,
+                                agentporchSessionId,
+                                provider: 'claude',
+                                reason: startResult.reason,
+                            });
+                            return;
+                        }
+                        await updateManualRouteTitleFromCommand({
+                            projectName: claudeProviderOptions?.projectName || data.options?.projectName || '',
+                            projectPath: claudeProviderOptions?.projectPath || claudeProviderOptions?.cwd || '',
+                            provider: 'claude',
+                            agentporchSessionId,
+                            command: data.command || '',
+                        });
+                    }
+                    console.log('[DEBUG] Claude request:', data.command || '[Continue/Resume]');
+                    console.log('📁 Project:', claudeProviderOptions?.projectPath || claudeProviderOptions?.cwd || 'Unknown');
+                    const claudePromptText = buildProviderPromptText(
+                        data.command || '',
+                        claudeProviderOptions?.attachments ?? data.options?.attachments,
+                    );
+                    const effectiveSessionId = claudeProviderOptions?.sessionId || data.sessionId || agentporchSessionId;
+                    await sendClaudeMessage({
+                        sessionId: agentporchSessionId || effectiveSessionId || `claude-${Date.now()}`,
+                        providerSessionId: claudeManualRuntime?.providerSessionId || (isAgentPorchRouteSessionId(effectiveSessionId) ? '' : effectiveSessionId) || '',
+                        projectPath: claudeProviderOptions?.projectPath || claudeProviderOptions?.cwd || '',
+                        text: claudePromptText,
+                        clientRequestId: routeInitToken || data.clientRequestId || null,
+                        writer: claudeRuntimeWriter,
+                    });
+                    // The adapter owns lifecycle acknowledgements and errors.
+                } else if (data.type === 'abort-session') {
                     console.log('[DEBUG] Abort session request:', data.sessionId);
                     const provider = normalizeManualProvider(data.provider || 'codex');
                     const agentporchSessionId = isAgentPorchRouteSessionId(data.agentporchSessionId || data.sessionId)
@@ -663,7 +749,9 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                     if (agentporchSessionId) {
                         // Cancel state is no longer persisted to conf.json.
                     }
-                    const result = await abortNativeSession(provider, agentporchSessionId || data.sessionId, data.projectPath || data.options?.projectPath || data.options?.cwd || '');
+                    const result = provider === 'claude'
+                        ? await abortClaudeSession(agentporchSessionId || data.sessionId, data.projectPath || data.options?.projectPath || data.options?.cwd || '')
+                        : await abortNativeSession(provider, agentporchSessionId || data.sessionId, data.projectPath || data.options?.projectPath || data.options?.cwd || '');
                     writer.send({
                         type: 'session-aborted',
                         sessionId: data.sessionId,
@@ -672,7 +760,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         projectPath: data.projectPath || data.options?.projectPath || data.options?.cwd || '',
                         success: result.aborted,
                     });} else if (data.type === 'claude-permission-response') {
-                    writer.send({ type: 'claude-error', error: 'Provider "claude" is no longer supported' });
+                    writer.send({ type: 'claude-error', error: 'Claude Code uses local tool permission settings; browser permission overrides are unavailable' });
                 } else if (data.type === 'subscribe-session') {
                     const provider = normalizeManualProvider(data.provider || 'codex');
                     rememberChatClientScope(ws, {
@@ -701,11 +789,9 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                 } else if (data.type === 'check-session-status') {
                     const provider = normalizeManualProvider(data.provider || 'codex');
                     const sessionId = data.agentporchSessionId || data.agentporch_session_id || data.sessionId;
-                    if (provider === 'claude') {
-                        /** Claude has no native AgentPorch runtime; the shell relay owns TUI state. */
-                        return;
-                    }
-                    const status = getNativeSessionStatus(provider, sessionId, data.projectPath || data.options?.projectPath || data.options?.cwd || '');
+                    const status = provider === 'claude'
+                        ? getClaudeSessionStatus(sessionId, data.projectPath || data.options?.projectPath || data.options?.cwd || '')
+                        : getNativeSessionStatus(provider, sessionId, data.projectPath || data.options?.projectPath || data.options?.cwd || '');
                     writer.send({
                         type: 'session-status',
                         sessionId,
@@ -719,7 +805,7 @@ export function createChatCommandDispatcher(deps: any, ws: WebSocket, request: a
                         turnStartedAt: status.turnStartedAt || '',
                         turn_started_at: status.turnStartedAt || '',
                     });} else if (data.type === 'get-active-sessions') {
-                    const activeSessions = getActiveNativeSessions();
+                    const activeSessions = { ...getActiveNativeSessions(), claude: getActiveClaudeSessions() };
                     writer.send({
                         type: 'active-sessions',
                         sessions: activeSessions,

@@ -31,7 +31,7 @@ function ChatInterface(props: ChatInterfaceProps) {
   const [searchHighlightRetry, setSearchHighlightRetry] = useState(0);
   const controls = useChatProviderState({ selectedSession, disableModelCatalogs: selectedSession?.__provider === 'hermes' });
   const provider = selectedSession?.__provider || controls.provider;
-  const readOnly = provider === 'hermes' || provider === 'claude';
+  const readOnly = provider === 'hermes';
   const resetStreamingState = useCallback(() => {
     if (streamTimerRef.current) clearTimeout(streamTimerRef.current);
     streamTimerRef.current = null;

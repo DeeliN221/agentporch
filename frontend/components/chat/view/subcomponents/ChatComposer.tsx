@@ -584,6 +584,7 @@ export default function ChatComposer({
                   </button>
                 )}
 
+                {provider === 'claude' && <span className="px-2 text-xs text-muted-foreground">Claude Code · local settings</span>}
                 {(provider === 'codex' || provider === 'pi') && (
                   <SessionModelControls
                     provider={provider}

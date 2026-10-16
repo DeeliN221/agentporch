@@ -8,6 +8,10 @@
 | --- | --- |
 | ![Mobile terminal](before-mobile.png) | ![Mobile web composer](after-mobile.png) |
 
-Actual local browser screenshots using synthetic projects and messages. The terminal output and Pi model are test fixtures; these images do not demonstrate a live model connection. No screenshot pixels were edited.
+| Claude Code desktop | Claude Code mobile |
+| --- | --- |
+| ![Claude web conversation](claude-desktop.png) | ![Claude mobile conversation](claude-mobile.png) |
 
-Conversations use Codex app-server or the Pi SDK. The optional tmux project shell is independent of chat identity. Imported Hermes and legacy Claude histories are read-only.
+Actual local browser screenshots using synthetic projects and messages. The terminal output, Pi model, and Claude CLI are test fixtures; these images do not demonstrate a live model connection. No screenshot pixels were edited.
+
+Conversations use Codex app-server, the Pi SDK, or Claude Code print/stream-json. The optional tmux project shell is independent of chat identity. Imported Hermes histories are read-only.

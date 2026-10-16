@@ -786,7 +786,8 @@ export function useChatComposerState({
       // Determine send policy based on provider native capabilities.
       const providerCapabilities = provider === 'codex'
         ? { runningInput: ['steer', 'abort-and-send'], steer: true, followUp: false }
-        : { runningInput: ['steer', 'followUp'], steer: true, followUp: true };
+        : provider === 'pi' ? { runningInput: ['steer', 'followUp'], steer: true, followUp: true }
+        : { runningInput: [], steer: false, followUp: false };
 
       let runningBehavior: string | undefined;
       const runtimeSessionIds = [
@@ -804,13 +805,13 @@ export function useChatComposerState({
         if (canAbortSession || sessionHasActiveTurn) {
           runningBehavior = 'steer';
         }
-      } else if (canAbortSession || sessionIsProcessing) {
+      } else if (provider === 'pi' && (canAbortSession || sessionIsProcessing)) {
         runningBehavior = 'steer';
       }
 
-      if (provider === 'codex' || provider === 'pi') {
+      if (provider === 'codex' || provider === 'pi' || provider === 'claude') {
         sendMessage({
-          type: provider === 'pi' ? 'pi-command' : 'codex-command',
+          type: provider === 'claude' ? 'claude-command' : provider === 'pi' ? 'pi-command' : 'codex-command',
           clientRequestId,
           command: messageContent,
           sessionId: effectiveSessionId,
@@ -835,7 +836,7 @@ export function useChatComposerState({
             client_ref: messageContent,
             turnAnchorKey,
             resume: Boolean(effectiveSessionId),
-            model: provider === 'pi' ? piModel : codexModel,
+            model: provider === 'claude' ? undefined : provider === 'pi' ? piModel : codexModel,
             thinkingLevel: provider === 'pi' ? piThinkingLevel : undefined,
             reasoningEffort: codexReasoningEffort,
             serviceTier: codexServiceTier || null,

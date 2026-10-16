@@ -191,7 +191,7 @@ test('provider runtime boundary uses Codex app-server and Pi SDK independently o
   assert.match(router, /ensurePiSession/, 'Pi web chat uses the native SDK runtime');
   const composer = await readRepoFile('frontend/components/chat/composer/useChatComposerStateRuntime.impl.ts');
   assert.match(composer, /['"]pi-command['"]/, 'browser composer dispatches Pi messages');
-  assert.doesNotMatch(composer, /type:\s*['"]claude-command['"]/, 'browser composer must not send Claude runtime commands');
+  assert.match(composer, /['"]claude-command['"]/, 'browser composer dispatches Claude messages through its CLI adapter');
   assertExports(events, 'toProviderSessionStatusEvent');
   assertExports(events, 'toProviderRuntimeErrorEvent');
   assert.doesNotMatch(nativeRuntime, /@openai\/codex-sdk/);

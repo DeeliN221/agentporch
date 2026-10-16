@@ -748,6 +748,8 @@ export function useChatRealtimeHandlers({
         break;
 
       case 'claude-error':
+        clearLoadingIndicators();
+        markSessionsAsCompleted(currentSessionId, selectedSession?.id);
         updateChatMessages({ type: 'errorMessageAppended', content: `Error: ${latestMessage.error}` });
         break;
 

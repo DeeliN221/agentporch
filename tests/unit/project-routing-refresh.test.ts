@@ -139,7 +139,7 @@ test('project cN route honors provider hint for Pi sessions', () => {
 });
 
 test('Claude cN route restores provider ownership without a query hint', () => {
-  /** Claude 索引会先提供 provider 字段；直达或重载 URL 仍必须进入同一 Claude TUI。 */
+  /** Claude index ownership must survive direct links and reloads of the same web conversation. */
   const project = buildProjectFixture();
   project.claudeSessions = [{
     id: 'claude-7',
